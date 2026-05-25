@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Library</OutputType>
+		<TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<LangVersion>latest</LangVersion>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<RootNamespace>MmapCache</RootNamespace>
+		<AssemblyName>MmapCache</AssemblyName>
+
+		<!-- ── NuGet Package Metadata ── -->
+		<PackageId>MmapCache</PackageId>
+		<Version>1.0.0</Version>
+		<Authors>BurakKontas</Authors>
+		<Company>kontas.tr</Company>
+		<Description>
+			Zero-downtime, memory-mapped cache for .NET.
+			Stores data in off-heap mmap shard files with a FasterKV index.
+			Supports TTL-based background reload, atomic version swap,
+			and warm restart (resumes from disk without hitting the data source).
+		</Description>
+		<Summary>Off-heap mmap cache with zero-downtime reload and warm restart.</Summary>
+
+		<PackageTags>cache;mmap;memory-mapped;faster;off-heap;high-performance</PackageTags>
+		<PackageProjectUrl>https://github.com/BurakKontas/MmapCache</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/BurakKontas/MmapCache</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+
+		<!-- Deterministic builds + Source Link (debugger steps into your source) -->
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<EmbedUntrackedSources>true</EmbedUntrackedSources>
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+		<!-- XML doc comments → IntelliSense in consumer projects -->
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<NoWarn>$(NoWarn);1591</NoWarn>
+	</PropertyGroup>
+
+	<!-- README and icon are bundled into the .nupkg -->
+	<ItemGroup>
+		<None Include="..\..\README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+	<!-- Source Link — maps the pdb back to GitHub so debuggers work -->
+	<ItemGroup>
+		<PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.FASTER.Core" Version="2.6.5" />
+		<PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="8.0.0" />
+	</ItemGroup>
+
+</Project>
