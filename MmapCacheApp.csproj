@@ -27,7 +27,7 @@
 		<PackageProjectUrl>https://github.com/BurakKontas/MmapCache</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/BurakKontas/MmapCache</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
-		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageLicenseExpression>GPL-3</PackageLicenseExpression>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
 
 		<!-- Deterministic builds + Source Link (debugger steps into your source) -->
