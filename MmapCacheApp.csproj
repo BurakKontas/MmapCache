@@ -43,7 +43,7 @@
 
 	<!-- README and icon are bundled into the .nupkg -->
 	<ItemGroup>
-		<None Include="..\..\README.md" Pack="true" PackagePath="\" />
+		<None Include="README.md" Pack="true" PackagePath="\" />
 	</ItemGroup>
 
 	<!-- Source Link — maps the pdb back to GitHub so debuggers work -->
