@@ -1,7 +1,9 @@
-namespace MmapCacheApp.Config;
+using MmapCache.Cache;
+
+namespace MmapCache.Config;
 
 /// <summary>All settings needed to build and reload one named mmap cache.</summary>
-public sealed class MmapCacheDefinition<TValue>
+public sealed class MmapCacheDefinition<TValue> : ICacheDefinition
 {
     /// <summary>Logical name — also used as the sub-directory under BasePath.</summary>
     public required string Name { get; init; }
