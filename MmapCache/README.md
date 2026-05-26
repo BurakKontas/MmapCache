@@ -29,9 +29,9 @@ MmapCache stores data in off-heap memory-mapped (`mmap`) segment files utilizing
 
 Most in-process caches and embedded stores suffer from:
 
-* **GC Fragmentation & Pauses** — Constantly overwriting objects creates holes in the managed heap, leading to severe garbage collection compaction cycles.
-* **Data Volatility** — Standard caching layers lose all mutated state instantly if the target process crashes or suffers an unhandled termination.
-* **Reload Lockouts** — Having to periodically rebuild large data structures entirely from external databases is expensive, slow, and resource-heavy.
+* **GC Fragmentation & Pauses** - Constantly overwriting objects creates holes in the managed heap, leading to severe garbage collection compaction cycles.
+* **Data Volatility** - Standard caching layers lose all mutated state instantly if the target process crashes or suffers an unhandled termination.
+* **Reload Lockouts** - Having to periodically rebuild large data structures entirely from external databases is expensive, slow, and resource-heavy.
 
 By restructuring the system strictly with an LSM architecture, every mutation is recorded purely with append-friendly I/O to a sequential `WAL` and a memory-efficient `Radix Tree MemTable`. When size triggers are reached, the memory is locked, serialized continuously off-heap into an SSTable mapped strictly via OS memory-mapping (`mmap`), and native pointers are safely recycled. This effectively guarantees **Zero Managed Memory Leaks** and deterministic overhead over time.
 
@@ -41,7 +41,7 @@ By restructuring the system strictly with an LSM architecture, every mutation is
 
 | Feature | Description |
 | --- | --- |
-| **Off-Heap Storage** | Immutable segment files (`.sst`) are directly `mmap`'d — ensuring zero GC pressure regardless of dataset size. |
+| **Off-Heap Storage** | Immutable segment files (`.sst`) are directly `mmap`'d - ensuring zero GC pressure regardless of dataset size. |
 | **Concurrent Radix Tree** | Global indexing and MemTables use a highly optimized Prefix Tree (Trie), reducing RAM usage drastically via prefix sharing (e.g., `user_1`, `user_2`) and providing native lexicographical sorting. |
 | **Bloom Filter** | A spin-locked Counting Bloom Filter sits in front of read requests. Non-existent keys skip trie traversal and disk I/O entirely. |
 | **Write-Ahead Log (WAL)** | Append-only sequential I/O ensures durable crashes and fast recovery using stateful frame synchronization. |
@@ -58,7 +58,7 @@ dotnet add package MmapCache
 
 Targets **net8.0**, **net9.0**, and **net10.0**.
 
-> ?? MmapCache is released under the **GPL-3.0** license. If you intend to use it inside a closed-source commercial product, review the license terms carefully.
+> -- MmapCache is released under the **GPL-3.0** license. If you intend to use it inside a closed-source commercial product, review the license terms carefully.
 
 ---
 
@@ -69,11 +69,11 @@ using MmapCache.Cache;
 using MmapCache.Config;
 using System.Text.Json;
 
-// ?? 1. Initialize once at application startup ?????????????????????????????????
+// -- 1. Initialize once at application startup --------------------------------?
 MmapCacheManager.Initialize(
     basePath : "/var/cache/myapp");  // LSM log and sst files are written here
 
-// ?? 2. Describe what to store ?????????????????????????????????????????????????
+// -- 2. Describe what to store ------------------------------------------------?
 var productDef = new MmapCacheDefinition<Product>
 {
     Name = "products",
@@ -84,22 +84,22 @@ var productDef = new MmapCacheDefinition<Product>
     Ttl = TimeSpan.FromHours(1)
 };
 
-// ?? 3. Register Engine Instance ???????????????????????????????????????????????
+// -- 3. Register Engine Instance ----------------------------------------------?
 // Restores from on-disk SSTables instantly, replays WAL if recovering from a crash.
 MmapCacheManager.Instance.Register(productDef);
 
-// ?? 4. Active Mutability (Put/Delete) ?????????????????????????????????????????
+// -- 4. Active Mutability (Put/Delete) ----------------------------------------?
 // Mutations are immediately visible and durably piped to the active WAL
 MmapCacheManager.Instance.Put("products", "product_42", new Product("product_42", "Updated!", 9.99m, 50));
 MmapCacheManager.Instance.Delete("products", "product_99");
 
-// ?? 5. Concurrent Reads (lock-free logic) ?????????????????????????????????????
+// -- 5. Concurrent Reads (lock-free logic) ------------------------------------?
 var product = MmapCacheManager.Instance.Get<Product>("products", "product_42");
 
 if (MmapCacheManager.Instance.TryGet<Product>("products", "product_42", out var p))
     Console.WriteLine(p!.Name);
 
-// ?? 6. Dispose on shutdown ????????????????????????????????????????????????????
+// -- 6. Dispose on shutdown ----------------------------------------------------
 // Safely unmaps memory handles and flushes remaining active WAL stream buffers
 await MmapCacheManager.Instance.DisposeAsync();
 ```
@@ -154,14 +154,14 @@ The metrics below represent the performance of the off-heap unmanaged engine und
 
 | Record Count | RadixTree Capacity | Flush Threshold | Write Duration | Write Throughput | Read Duration | Read Throughput | Avg Latency | Disk Footprint | Post-Write Working Set | Post-Read Working Set | GC Collections (Gen0/Gen1/Gen2) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **1K** | 2,000 | 64 MB | 39 ms | 25,570/s | 10 ms | 91,557/s | 10.64 µs | 0.11 MB | 62.20 MB | 62.47 MB | 0 / 0 / 0 |
-| **10K** | 15,000 | 64 MB | 157 ms | 63,410/s | 39 ms | 250,872/s | 3.94 µs | 1.16 MB | 34.29 MB | 40.50 MB | 0 / 0 / 0 |
-| **100K** | 150,000 | 32 MB | 779 ms | 128,268/s | 332 ms | 300,333/s | 3.30 µs | 11.89 MB | 63.45 MB | 73.13 MB | 5 / 1 / 0 |
-| **1M** | 1,500,000 | 32 MB | 5,101 ms | 196,028/s | 1,749 ms | 571,649/s | 1.72 µs | 118.03 MB | 180.23 MB | 258.03 MB | 55 / 12 / 7 |
-| **5M** | 7,000,000 | 16 MB | 36,427 ms | 137,259/s | 7,678 ms | 651,128/s | 1.46 µs | 602.43 MB | 15.68 MB | 40.84 MB | 310 / 114 / 78 |
-| **10M** | 12,500,000 | 16 MB | 76,647 ms | 130,467/s | 16,002 ms | 624,918/s | 1.52 µs | 1,208.15 MB | 7.84 MB | 79.22 MB | 608 / 222 / 150 |
-| **50M** | 65,000,000 | 4 MB | 390,336 ms | 128,095/s | 83,076 ms | 601,853/s | 1.57 µs | 6,167.18 MB | 2.62 MB | 387.79 MB | 3,591 / 1,978 / 1,136 |
-| **100M** | 115,000,000 | 2 MB | 813,904 ms | 122,865/s | 196,056 ms | 510,057/s | 1.86 µs | 12,365.99 MB | 2.56 MB | 766.00 MB | 7,039 / 4,154 / 2,686 |
+| **1K** | 2,000 | 64 MB | 39 ms | 25,570/s | 10 ms | 91,557/s | 10.64 us | 0.11 MB | 62.20 MB | 62.47 MB | 0 / 0 / 0 |
+| **10K** | 15,000 | 64 MB | 157 ms | 63,410/s | 39 ms | 250,872/s | 3.94 us | 1.16 MB | 34.29 MB | 40.50 MB | 0 / 0 / 0 |
+| **100K** | 150,000 | 32 MB | 779 ms | 128,268/s | 332 ms | 300,333/s | 3.30 us | 11.89 MB | 63.45 MB | 73.13 MB | 5 / 1 / 0 |
+| **1M** | 1,500,000 | 32 MB | 5,101 ms | 196,028/s | 1,749 ms | 571,649/s | 1.72 us | 118.03 MB | 180.23 MB | 258.03 MB | 55 / 12 / 7 |
+| **5M** | 7,000,000 | 16 MB | 36,427 ms | 137,259/s | 7,678 ms | 651,128/s | 1.46 us | 602.43 MB | 15.68 MB | 40.84 MB | 310 / 114 / 78 |
+| **10M** | 12,500,000 | 16 MB | 76,647 ms | 130,467/s | 16,002 ms | 624,918/s | 1.52 us | 1,208.15 MB | 7.84 MB | 79.22 MB | 608 / 222 / 150 |
+| **50M** | 65,000,000 | 4 MB | 390,336 ms | 128,095/s | 83,076 ms | 601,853/s | 1.57 us | 6,167.18 MB | 2.62 MB | 387.79 MB | 3,591 / 1,978 / 1,136 |
+| **100M** | 115,000,000 | 2 MB | 813,904 ms | 122,865/s | 196,056 ms | 510,057/s | 1.86 us | 12,365.99 MB | 2.56 MB | 766.00 MB | 7,039 / 4,154 / 2,686 |
 
 > **Note:** GC counts shown are cumulative across both write and read phases for each test iteration. Write throughput remains consistently above 120K ops/sec even at 100M scale, demonstrating linear scalability.
 
@@ -169,16 +169,16 @@ The metrics below represent the performance of the off-heap unmanaged engine und
 
 | Record Count | p50 | p95 | p99 | p99.9 | Max Latency |
 | --- | --- | --- | --- | --- | --- |
-| **1K** | 2.60 µs | 3.40 µs | 12.60 µs | 7,619.00 µs | 7,619.00 µs |
-| **10K** | 3.10 µs | 6.90 µs | 12.10 µs | 21.20 µs | 151.20 µs |
-| **100K** | 3.10 µs | 4.50 µs | 6.10 µs | 11.30 µs | 1,691.40 µs |
-| **1M** | 1.40 µs | 3.30 µs | 5.10 µs | 15.50 µs | 10,994.80 µs |
-| **5M** | 1.30 µs | 2.20 µs | 3.20 µs | 7.00 µs | 2,598.30 µs |
-| **10M** | 1.40 µs | 2.30 µs | 3.60 µs | 7.20 µs | 2,171.90 µs |
-| **50M** | 1.40 µs | 2.30 µs | 4.60 µs | 23.70 µs | 5,312.80 µs |
-| **100M** | 1.30 µs | 2.20 µs | 5.00 µs | 42.00 µs | 36,225.70 µs |
+| **1K** | 2.60 us | 3.40 us | 12.60 us | 7,619.00 us | 7,619.00 us |
+| **10K** | 3.10 us | 6.90 us | 12.10 us | 21.20 us | 151.20 us |
+| **100K** | 3.10 us | 4.50 us | 6.10 us | 11.30 us | 1,691.40 us |
+| **1M** | 1.40 us | 3.30 us | 5.10 us | 15.50 us | 10,994.80 us |
+| **5M** | 1.30 us | 2.20 us | 3.20 us | 7.00 us | 2,598.30 us |
+| **10M** | 1.40 us | 2.30 us | 3.60 us | 7.20 us | 2,171.90 us |
+| **50M** | 1.40 us | 2.30 us | 4.60 us | 23.70 us | 5,312.80 us |
+| **100M** | 1.30 us | 2.20 us | 5.00 us | 42.00 us | 36,225.70 us |
 
-**Key Insight:** p50 latency remains **< 3.1 µs** across all scales. Even at 100M records, the median read latency is only 1.30 µs, proving the effectiveness of the unmanaged RadixTree and Bloom Filter front-end.
+**Key Insight:** p50 latency remains **< 3.1 us** across all scales. Even at 100M records, the median read latency is only 1.30 us, proving the effectiveness of the unmanaged RadixTree and Bloom Filter front-end.
 
 ### Detailed Heap Metrics (100M Record Benchmark)
 
@@ -187,7 +187,7 @@ The metrics below represent the performance of the off-heap unmanaged engine und
 | **Baseline (Empty)** | 11.96 MB | 1.31 MB | 0.05 MB | 0.03 MB | 0 | 0 | 0 | 0.09 MB | 0.02 MB |
 | **Post-Write** | 2.56 MB | 5.42 MB | 0.00 MB | 70,471.95 MB | 7,039 | 4,154 | 2,686 | 0.09 MB | 0.02 MB |
 | **Post-Read** | 766.00 MB | 767.64 MB | 0.00 MB | 54,856.30 MB | 4,801 | 401 | 401 | 763.03 MB | 0.02 MB |
-| **After Cleanup** | 0.81 MB | — | — | — | — | — | — | — | — |
+| **After Cleanup** | 0.81 MB | - | - | - | - | - | - | - | - |
 
 ### Architectural Insights & Analysis
 
@@ -205,12 +205,12 @@ While total read duration naturally scales with dataset size, per-operation late
 
 | Scale | Avg Read Latency | p50 | p95 | p99 |
 | --- | --- | --- | --- | --- |
-| 1K | 10.64 µs | 2.60 µs | 3.40 µs | 12.60 µs |
-| 100K | 3.30 µs | 3.10 µs | 4.50 µs | 6.10 µs |
-| 1M | 1.72 µs | 1.40 µs | 3.30 µs | 5.10 µs |
-| 100M | 1.86 µs | 1.30 µs | 2.20 µs | 5.00 µs |
+| 1K | 10.64 us | 2.60 us | 3.40 us | 12.60 us |
+| 100K | 3.30 us | 3.10 us | 4.50 us | 6.10 us |
+| 1M | 1.72 us | 1.40 us | 3.30 us | 5.10 us |
+| 100M | 1.86 us | 1.30 us | 2.20 us | 5.00 us |
 
-**Key takeaway:** After warm-up, read latency stabilizes to **~1.5–1.9 µs** average regardless of dataset size. Pointer hopping on unmanaged memory layout, combined with front-facing Bloom Filter evaluations, keeps read speeds isolated from scale degradation.
+**Key takeaway:** After warm-up, read latency stabilizes to **~1.5–1.9 us** average regardless of dataset size. Pointer hopping on unmanaged memory layout, combined with front-facing Bloom Filter evaluations, keeps read speeds isolated from scale degradation.
 
 #### 3. Write Throughput Scaling
 
@@ -251,7 +251,7 @@ The write phase generates most GC pressure due to serialization and temporary bu
 * **Prefix Memory Sharing:** By replacing traditional Hash Maps with a `ConcurrentRadixTree`, keys with common prefixes (like `session_xyz`, `session_abc`) share memory nodes. This prevents massive string allocation overheads and reduces the managed heap footprint significantly.
 * **Lock-Free Reads:** Read traversals down the Radix Tree do not use heavy locking mechanisms (like `ReaderWriterLock` or `SemaphoreSlim`). Node structural integrity is maintained safely, allowing thousands of concurrent reads.
 * **GC Impact is Minimal:** The only managed allocation per read is the deserialized `TValue` object. Shard data and binary payloads are sliced directly from the `MemoryMappedViewAccessor` via zero-copy `ReadOnlySpan<byte>`.
-* **Deterministic Cleanup:** After each stress test iteration, the engine returns to **~0.8 MB working set** — proof of zero memory leaks in the unmanaged layer.
+* **Deterministic Cleanup:** After each stress test iteration, the engine returns to **~0.8 MB working set** - proof of zero memory leaks in the unmanaged layer.
 
 ---
 
@@ -266,13 +266,13 @@ dotnet build
 dotnet test MmapCache.Tests/MmapCache.Tests.csproj -v normal
 ```
 
-Please note that contributions are subject to the terms of the GPL-3.0 license — by submitting a pull request you agree that your contribution will be distributed under the same license terms.
+Please note that contributions are subject to the terms of the GPL-3.0 license - by submitting a pull request you agree that your contribution will be distributed under the same license terms.
 
 ---
 
 ## License
 
-Copyright (C) 2026 Arda Burak Konta?
+Copyright (C) 2026 Arda Burak Kontas
 
 MmapCache is free software: you can redistribute it and/or modify it under the terms of the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html) as published by the Free Software Foundation.
 
