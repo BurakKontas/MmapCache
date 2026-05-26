@@ -2,6 +2,11 @@
 
 namespace MmapCache.Lsm;
 
+/// <summary>
+/// A fast Write-Ahead Log (WAL) writer for ensuring crash durability.
+/// Every mutation is streamed sequentially to disk with a CRC32 checksum 
+/// before it enters the active MemTable.
+/// </summary>
 public class WalWriter : IDisposable
 {
     private readonly FileStream _stream;
@@ -13,6 +18,10 @@ public class WalWriter : IDisposable
         _writer = new BinaryWriter(_stream);
     }
 
+    /// <summary>
+    /// Appends a new modification securely into the log.
+    /// </summary>
+    /// <param name="opType">0 corresponds to Put; 1 corresponds to Delete.</param>
     public void Append(byte opType, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         // Format: [CRC32:4] [OpType:1] [KeyLen:4] [ValueLen:4] [Key] [Value]

@@ -18,13 +18,11 @@
 		<Company>kontas.tr</Company>
 
 		<Description>
-			LSM-based storage engine for .NET.
-			Stores data in off-heap mmap segment files with a lock-free LSM architecture.
-			Supports WAL crash-recovery, active mutations, automatic background compaction,
-			and completely lock-free segment reads.
+			MmapCache stores data in off-heap memory-mapped (`mmap`) segment files utilizing a lock-free LSM (Log-Structured Merge-tree) architecture. 
+			It fully supports WAL (Write-Ahead Log) crash-recovery, active live mutations, automatic background compaction, and completely lock-free segment reads.
 		</Description>
 		
-		<Summary>Off-heap LSM storage engine with active mutation support and zero-downtime compaction.</Summary>
+		<Summary>An off-heap LSM storage engine for .NET with active mutation support and zero-downtime compaction.</Summary>
 		
 		<PackageTags>cache;mmap;memory-mapped;lsm;storage-engine;off-heap;high-performance;wal;compaction</PackageTags>
 		
@@ -53,7 +51,6 @@
 
 	<ItemGroup>
 		<PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
-		<PackageReference Include="Microsoft.FASTER.Core" Version="2.6.5" />
 		<PackageReference Include="System.IO.Hashing" Version="10.0.8" />
 	</ItemGroup>
 

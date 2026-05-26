@@ -2,6 +2,11 @@ using MmapCache.Cache;
 
 namespace MmapCache.Config;
 
+/// <summary>
+/// Zero-allocation deserializer for reading directly from the memory-mapped file.
+/// </summary>
+public delegate TValue SpanDeserializer<out TValue>(ReadOnlySpan<byte> span);
+
 /// <summary>All settings needed to build and reload one named mmap cache.</summary>
 public sealed class MmapCacheDefinition<TValue> : ICacheDefinition
 {
@@ -18,7 +23,7 @@ public sealed class MmapCacheDefinition<TValue> : ICacheDefinition
     public required Func<TValue, byte[]> Serializer { get; init; }
 
     /// <summary>Deserialize bytes read from the shard file → TValue.</summary>
-    public required Func<byte[], TValue> Deserializer { get; init; }
+    public required SpanDeserializer<TValue> Deserializer { get; init; }
 
     /// <summary>Background refresh interval. After this age a reload is triggered.</summary>
     public TimeSpan Ttl { get; init; } = TimeSpan.FromHours(1);
@@ -30,18 +35,13 @@ public sealed class MmapCacheDefinition<TValue> : ICacheDefinition
     /// </summary>
     public bool DynamicSizing { get; init; } = true;
 
-    public int MaxKeyBytes { get; init; } = 256;
-    public int MaxValueBytes { get; init; } = 4096;
-
-    /// <summary>Max records per shard file.</summary>
-    public long ShardCapacity { get; init; } = 200_000;
-
-    /// <summary>Number of FasterKV index shard files.</summary>
-    public int IndexShardCount { get; init; } = 16;
-
     /// <summary>Max entries in L1 MemoryCache. 0 = L1 disabled.</summary>
     public int L1MaxSize { get; init; } = 10_000;
 
     /// <summary>Per-entry TTL inside L1. null = LRU-only eviction.</summary>
     public TimeSpan? L1Ttl { get; init; }
+
+    /// <summary>Max entries in the MemTable's off-heap radix tree index. This should be sized to hold the expected number of keys in the MemTable before flushing to disk, to avoid costly resizing operations during heavy write phases.</summary>
+    public int RadixTreeCapacity { get; init; } = 1_000_000;
+    public int MemTableFlushThresholdBytes { get; init; } = 64 * 1024 * 1024;
 }

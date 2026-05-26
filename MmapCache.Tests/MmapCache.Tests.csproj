@@ -7,6 +7,8 @@
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<LangVersion>latest</LangVersion>
 		<IsPackable>false</IsPackable>
+		<PlatformTarget>x64</PlatformTarget>
+		<Prefer32Bit>false</Prefer32Bit>
 		<!-- Run each test class in isolation so the singleton is never shared -->
 		<ParallelizeTestCollections>false</ParallelizeTestCollections>
 	</PropertyGroup>

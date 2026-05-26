@@ -13,7 +13,7 @@ public sealed class MmapCacheManagerTests
     public void Initialize_ReturnsSameInstanceAsProperty()
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
         Assert.Same(mgr, MmapCacheManager.Instance);
     }
 
@@ -21,10 +21,10 @@ public sealed class MmapCacheManagerTests
     public void Initialize_CalledTwice_ThrowsInvalidOperationException()
     {
         using var tmp = new TempCacheDir();
-        MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        MmapCacheManager.Initialize(tmp.Path);
 
         Assert.Throws<InvalidOperationException>(() =>
-            MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1)));
+            MmapCacheManager.Initialize(tmp.Path));
     }
 
     [Fact]
@@ -40,7 +40,7 @@ public sealed class MmapCacheManagerTests
     public void Get_RegisteredKey_ReturnsValue()
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
         mgr.Register(TestFactory.WidgetDef("widgets", count: 10));
 
         var w = mgr.Get<Widget>("widgets", "widgets_5");
@@ -54,7 +54,7 @@ public sealed class MmapCacheManagerTests
     public void Get_MissingKey_ReturnsNull()
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
         mgr.Register(TestFactory.WidgetDef("widgets", count: 5));
 
         Assert.Null(mgr.Get<Widget>("widgets", "widgets_999"));
@@ -64,7 +64,7 @@ public sealed class MmapCacheManagerTests
     public void Get_UnregisteredCache_ReturnsNull()
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
 
         Assert.Null(mgr.Get<Widget>("no-such-cache", "any-key"));
     }
@@ -75,7 +75,7 @@ public sealed class MmapCacheManagerTests
     public void TryGet_ExistingKey_ReturnsTrueAndValue()
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
         mgr.Register(TestFactory.WidgetDef("w", count: 20));
 
         var found = mgr.TryGet<Widget>("w", "w_0", out var widget);
@@ -89,7 +89,7 @@ public sealed class MmapCacheManagerTests
     public void TryGet_MissingKey_ReturnsFalseAndDefault()
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
         mgr.Register(TestFactory.WidgetDef("w", count: 5));
 
         var found = mgr.TryGet<Widget>("w", "w_999", out var widget);
@@ -98,7 +98,7 @@ public sealed class MmapCacheManagerTests
         Assert.Null(widget);
     }
 
-    // ── Size ──────────────────────────────────────────────────────────────────
+    // ── Size (Validates Unmanaged Trie Live Record Counts) ────────────────────
 
     [Theory]
     [InlineData(1)]
@@ -107,17 +107,18 @@ public sealed class MmapCacheManagerTests
     public void Size_MatchesSuppliedCount(int count)
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
         mgr.Register(TestFactory.WidgetDef("w", count));
 
-        Assert.Equal(count, mgr.Size("w"));
+        // Now maps perfectly to _index.Count from the native radix tree layout
+        Assert.Equal((long)count, mgr.Size("w"));
     }
 
     [Fact]
     public void Size_UnregisteredCache_ReturnsZero()
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
 
         Assert.Equal(0L, mgr.Size("ghost"));
     }
@@ -128,7 +129,7 @@ public sealed class MmapCacheManagerTests
     public async Task ContinuousWrites_WhileConcurrentReadsRunning()
     {
         using var tmp = new TempCacheDir();
-        var mgr = MmapCacheManager.Initialize(tmp.Path, ttlCheck: TimeSpan.FromHours(1));
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
         mgr.Register(TestFactory.WidgetDef("w", count: 200));
 
         bool reading = true;
@@ -157,7 +158,7 @@ public sealed class MmapCacheManagerTests
 
         Assert.True(hits > 0);
     }
-    
+
     [Fact]
     public async Task ReloadAsync_ClearsExistingAndLoadsFromSupplier()
     {
@@ -171,7 +172,7 @@ public sealed class MmapCacheManagerTests
             Supplier = () =>
             {
                 supplierCalls++;
-                // İlk çağrıda 1 widget, ikinci çağrıda 2 widget dönsün
+                // First call yields 1 item, second call yields 2 items
                 if (supplierCalls == 1) return TestFactory.MakeWidgets(1, "w");
                 return TestFactory.MakeWidgets(2, "w");
             },
@@ -179,25 +180,25 @@ public sealed class MmapCacheManagerTests
             Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
         });
 
-        // İlk register işlemi Supplier'ı çalıştırdı
+        // Initial registration should execute the supplier once
         Assert.Equal(1, supplierCalls);
         Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
 
-        // Manuel olarak dışarıdan bir data ekleyelim
+        // Insert an ephemeral record manually
         mgr.Put("w", "manual_key", new Widget("manual_key", "Manual", 9.99m, 5));
         Assert.NotNull(mgr.Get<Widget>("w", "manual_key"));
 
-        // RELOAD TETİKLE (Motoru tamamen temizleyip supplier'dan baştan çekecek)
+        // RELOAD: Wipe the engine state completely and refresh from the updated supplier stream
         await mgr.ReloadAsync<Widget>("w");
 
-        // Supplier 2. kez çağrılmış olmalı
+        // Supplier must be invoked for the 2nd time
         Assert.Equal(2, supplierCalls);
 
-        // w_0 ve yeni eklenen w_1 artık var olmalı
+        // Verified that new values exist in the freshly built unmanaged arena
         Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
         Assert.NotNull(mgr.Get<Widget>("w", "w_1"));
 
-        // Manuel eklediğimiz data "Clear" ile uçmuş olmalı
+        // The manual key must be cleared out cleanly by the atomic reset execution
         Assert.Null(mgr.Get<Widget>("w", "manual_key"));
     }
 
@@ -207,35 +208,34 @@ public sealed class MmapCacheManagerTests
         using var tmp = new TempCacheDir();
         var mgr = MmapCacheManager.Initialize(tmp.Path);
 
-        // Default TTL'i 1 saat olan bir tanım
         mgr.Register(TestFactory.WidgetDef("w", 0, ttl: TimeSpan.FromHours(1)));
 
-        // Özel TTL vererek Put yap (50 ms)
+        // Write with a very short custom TTL (50 milliseconds)
         mgr.Put("w", "expire_me", new Widget("1", "Test", 1m, 1), TimeSpan.FromMilliseconds(50));
-        
-        // Data girildi, var olmalı
+
+        // Value must be fully retrievable immediately after insertion
         var widget = mgr.Get<Widget>("w", "expire_me");
         Assert.NotNull(widget);
 
-        // 100 ms bekle (Sürenin dolduğundan emin olmak için)
-        await Task.Delay(100);
+        // Sleep past the TTL window boundary to guarantee expiration state
+        await Task.Delay(120);
 
-        // Lazy Expiration tetiklenmeli
+        // Lazy Expiration mechanism triggers here
         widget = mgr.Get<Widget>("w", "expire_me");
-        Assert.Null(widget); // Süresi dolduğu için null gelmeli
+        Assert.Null(widget); // Must be dead/null
 
         bool exists = mgr.Exists("w", "expire_me");
         Assert.False(exists);
     }
-    
+
     [Fact]
     public async Task WarmRestart_ResumesFromDiskWithoutCallingSupplier()
     {
         using var tmp = new TempCacheDir();
-
         int supplierCalls = 0;
+
         var mgr = MmapCacheManager.Initialize(tmp.Path);
-        
+
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
@@ -252,11 +252,13 @@ public sealed class MmapCacheManagerTests
         var val1 = mgr.Get<Widget>("w", "w_0");
         Assert.NotNull(val1);
 
+        // Unmap memory structures and completely drop current live engine reference
         await mgr.DisposeAsync();
         SingletonReset.Reset();
 
+        // Spin up a brand new manager instance bound to the exact same physical directory path
         var mgr2 = MmapCacheManager.Initialize(tmp.Path);
-        
+
         mgr2.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
@@ -269,8 +271,10 @@ public sealed class MmapCacheManagerTests
             Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
         });
 
-        Assert.Equal(1, supplierCalls); // Should NOT have incremented!
-        
+        // CRITICAL CHECK: The supplier counter MUST remain 1 because LsmEngine restored everything 
+        // straight from the existing unmanaged SSTables on disk during the bootstrap process!
+        Assert.Equal(1, supplierCalls);
+
         var val2 = mgr2.Get<Widget>("w", "w_0");
         Assert.NotNull(val2);
     }

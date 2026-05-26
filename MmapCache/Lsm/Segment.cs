@@ -2,6 +2,11 @@
 
 namespace MmapCache.Lsm;
 
+/// <summary>
+/// Represents a static, immutable, durable on-disk data file (SSTable).
+/// This implementation relies on memory-mapped files (MMF) directly handled 
+/// via unmanaged pointers for ultimate zero-copy reads, eliminating GC heap overhead.
+/// </summary>
 public class Segment : IDisposable
 {
     public int SegmentId { get; }
@@ -23,6 +28,10 @@ public class Segment : IDisposable
         _basePtr = ptr;
     }
 
+    /// <summary>
+    /// Reads a memory segment directly utilizing the unmanaged base pointer of the memory-mapped file.
+    /// This achieves true zero-copy retrieval for blazing fast reads.
+    /// </summary>
     public unsafe ReadOnlySpan<byte> ReadValue(long offset, int length)
     {
         return new ReadOnlySpan<byte>(_basePtr + offset, length);

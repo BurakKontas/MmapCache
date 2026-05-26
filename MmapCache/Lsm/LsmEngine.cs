@@ -1,330 +1,439 @@
-﻿using System.Collections.Concurrent;
+﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace MmapCache.Lsm;
 
-public class LsmEngine : IDisposable
+public delegate void ValueSpanConsumer(ReadOnlySpan<byte> valueSpan);
+
+/// <summary>
+/// A high-performance Log-Structured Merge (LSM) Tree engine adapted for high concurrency.
+/// It uses a MemTable for in-memory active data, Write-Ahead Logs (WAL) for crash recovery,
+/// and flushed unmanaged SSTable segments for durable disk storage.
+/// </summary>
+public unsafe class LsmEngine : IDisposable
 {
-    private MemTable _activeMemTable = new();
-    private readonly ConcurrentQueue<MemTable> _flushingMemTables = new();
-    private WalWriter _activeWal;
-    private readonly ConcurrentDictionary<string, IndexRecord> _index = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<int, Segment> _segments = new();
-    private readonly object _flushLock = new();
+/// <summary>
+/// The currently active MemTable accepting new writes.
+/// </summary>
+private MemTable _activeMemTable;
+
+/// <summary>
+/// MemTables currently in the process of being flushed to disk. Keys in here remain readable.
+/// </summary>
+private readonly ConcurrentDictionary<int, MemTable> _flushingMemTables = new();
+
+/// <summary>
+/// Write-Ahead Log for durable persistence prior to flushing. 
+/// </summary>
+private WalWriter _activeWal;
+
+/// <summary>
+/// BloomFilter allowing 0-IO misses for non-existent keys.
+/// </summary>
+private readonly BloomFilter _bloomFilter;
+
+/// <summary>
+/// The global unmanaged radix index for all memory and disk segments.
+/// </summary>
+private readonly ConcurrentRadixTree<IndexRecord> _index;
+
+/// <summary>
+/// Tracks all active Memory-Mapped SSTable segments currently on disk.
+/// </summary>
+private readonly ConcurrentDictionary<int, Segment> _segments = new();
+
+private readonly object _flushLock = new();
+
+/// <summary>
+/// Backpressure semaphore limiting max concurrent background flush tasks.
+/// </summary>
+private readonly SemaphoreSlim _flushSemaphore = new(initialCount: 2, maxCount: 2);
+    private readonly ReaderWriterLockSlim _engineLock = new(LockRecursionPolicy.NoRecursion);
+    private readonly object _walLock = new();
 
     private readonly string _dir;
     private int _nextSegmentId = 0;
-    
-    // Configs
-    private readonly long _flushThresholdBytes = 64 * 1024 * 1024; // 64 MB
+    private int _isDisposed = 0;
+    private long _totalLiveCount = 0;
+    private readonly long _flushThresholdBytes;
+    private readonly int _radixTreeCapacity;
 
-    public LsmEngine(string directory, long flushThresholdBytes = 64 * 1024 * 1024)
+    public long Count => Interlocked.Read(ref _totalLiveCount);
+
+    public LsmEngine(string directory, long flushThresholdBytes = 64 * 1024 * 1024, int radixTreeCapacity = 1_000_000)
     {
         _dir = directory;
         _flushThresholdBytes = flushThresholdBytes;
-        
+        _radixTreeCapacity = radixTreeCapacity;
+
         Directory.CreateDirectory(_dir);
-        
+
+        _index = new ConcurrentRadixTree<IndexRecord>(radixTreeCapacity);
+        _bloomFilter = new BloomFilter(capacity: Math.Max(radixTreeCapacity, 1_000_000), errorRate: 0.01);
+        _activeMemTable = new MemTable(_flushThresholdBytes, _radixTreeCapacity);
+
         Bootstrap();
 
-        // Setup initial WAL
-        string walPath = Path.Combine(_dir, $"wal_{_nextSegmentId}.log");
-        _activeWal = new WalWriter(walPath);
+        _activeWal = new WalWriter(Path.Combine(_dir, $"wal_{_nextSegmentId}.log"));
     }
 
     private void Bootstrap()
     {
-        int maxId = 0;
-        var sstFiles = Directory.GetFiles(_dir, "segment_*.sst");
+        if (!Directory.Exists(_dir)) return;
+
+        var sstFiles = Directory.GetFiles(_dir, "segment_*.sst")
+            .Select(f => {
+                var name = Path.GetFileNameWithoutExtension(f);
+                int id = int.Parse(name.Split('_')[1]);
+                return new { Id = id, Path = f };
+            })
+            .OrderBy(s => s.Id)
+            .ToList();
+
         foreach (var sst in sstFiles)
         {
-            string name = Path.GetFileNameWithoutExtension(sst);
-            if (!int.TryParse(name.Substring("segment_".Length), out int sid)) continue;
-            maxId = Math.Max(maxId, sid);
+            var segment = new Segment(sst.Id, sst.Path);
+            _segments[sst.Id] = segment;
+            _nextSegmentId = Math.Max(_nextSegmentId, sst.Id + 1);
 
-            var segment = new Segment(sid, sst);
-            _segments[sid] = segment;
-            
-            using var fs = new FileStream(sst, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var fs = new FileStream(sst.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024);
             using var br = new BinaryReader(fs);
-            long offset = 0;
-            while (fs.Position < fs.Length)
+
+            long currentOffset = 0;
+            long fileLength = fs.Length;
+
+            while (currentOffset < fileLength)
             {
-                long recStart = offset;
                 bool isDeleted = br.ReadBoolean();
                 int kLen = br.ReadInt32();
                 int vLen = br.ReadInt32();
-                byte[] kBytes = br.ReadBytes(kLen);
-                string key = Encoding.UTF8.GetString(kBytes);
-                
+                byte[] keyBytes = br.ReadBytes(kLen);
+                fs.Seek(vLen, SeekOrigin.Current);
+
+                string key = Encoding.UTF8.GetString(keyBytes);
+                long valOffset = currentOffset + 1 + 4 + 4 + kLen;
+
                 if (!isDeleted)
                 {
-                    fs.Position += vLen; // skip value
-                    _index[key] = new IndexRecord { IsMemTable = false, SegmentId = sid, Offset = recStart + 9 + kLen, Length = vLen };
+                    _index.Put(key, new IndexRecord
+                    {
+                        IsMemTable = false,
+                        SegmentId = sst.Id,
+                        Offset = valOffset,
+                        Length = vLen
+                    });
+                    _bloomFilter.Add(key);
+                    Interlocked.Increment(ref _totalLiveCount);
                 }
-                else
-                {
-                    _index.TryRemove(key, out _);
-                }
-                offset += 9 + kLen + (isDeleted ? 0 : vLen);
+
+                currentOffset += 1 + 4 + 4 + kLen + vLen;
             }
         }
-
-        var walFiles = Directory.GetFiles(_dir, "wal_*.log");
-        foreach (var wal in walFiles)
-        {
-            string name = Path.GetFileNameWithoutExtension(wal);
-            if (!int.TryParse(name.Substring("wal_".Length), out int wid)) continue;
-            maxId = Math.Max(maxId, wid);
-
-            using var fs = new FileStream(wal, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            using var br = new BinaryReader(fs);
-            while (fs.Position < fs.Length)
-            {
-                if (fs.Length - fs.Position < 4) break;
-                uint crc = br.ReadUInt32();
-                
-                try
-                {
-                    byte op = br.ReadByte();
-                    int kLen = br.ReadInt32();
-                    int vLen = br.ReadInt32();
-                    byte[] kBytes = br.ReadBytes(kLen);
-                    byte[] vBytes = br.ReadBytes(vLen);
-
-                    string key = Encoding.UTF8.GetString(kBytes);
-                    if (op == 0)
-                    {
-                        _activeMemTable.Put(key, vBytes);
-                        _index[key] = new IndexRecord { IsMemTable = true };
-                    }
-                    else
-                    {
-                        _activeMemTable.Delete(key);
-                        _index[key] = new IndexRecord { IsMemTable = true };
-                    }
-                }
-                catch (EndOfStreamException) { break; }
-            }
-        }
-        
-        _nextSegmentId = maxId + 1;
     }
 
-    public void Put(string key, byte[] value)
+    public void Put(string key, ReadOnlySpan<byte> value)
     {
-        var keySpan = Encoding.UTF8.GetBytes(key);
-        
-        lock (_flushLock)
+        _engineLock.EnterReadLock();
+        try
         {
-            _activeWal.Append(0, keySpan, value);
+            if (Volatile.Read(ref _isDisposed) == 1)
+                throw new ObjectDisposedException(nameof(LsmEngine));
+
+            ReadOnlySpan<byte> keyBytes = KeyEncoder.AsSpan(key);
+
+            lock (_walLock)
+            {
+                _activeWal.Append(0, keyBytes, value);
+            }
+
             _activeMemTable.Put(key, value);
-            _index[key] = new IndexRecord { IsMemTable = true };
+            _bloomFilter.Add(key);
+            Interlocked.Increment(ref _totalLiveCount);
+        }
+        finally
+        {
+            _engineLock.ExitReadLock();
         }
 
-        CheckFlush();
+        if (_activeMemTable.Size >= _flushThresholdBytes)
+            TriggerFlush();
     }
 
-    public ReadOnlySpan<byte> Get(string key)
-    {
-        if (!_index.TryGetValue(key, out var record))
-        {
-            return default;
-        }
-
-        if (record.IsMemTable)
-        {
-            if (_activeMemTable.TryGet(key, out bool isDeleted, out byte[] value))
-            {
-                if (isDeleted) return default;
-                return value;
-            }
-            
-            foreach (var flushing in _flushingMemTables)
-            {
-                if (flushing.TryGet(key, out isDeleted, out value))
-                {
-                    if (isDeleted) return default;
-                    return value;
-                }
-            }
-        }
-
-        if (_segments.TryGetValue(record.SegmentId, out var segment))
-        {
-            return segment.ReadValue(record.Offset, record.Length);
-        }
-
-        return default;
-    }
+    public void Put(string key, byte[] value) => Put(key, value.AsSpan());
 
     public void Delete(string key)
     {
-        var keySpan = Encoding.UTF8.GetBytes(key);
-        
-        lock (_flushLock)
+        _engineLock.EnterReadLock();
+        try
         {
-            _activeWal.Append(1, keySpan, ReadOnlySpan<byte>.Empty);
+            if (Volatile.Read(ref _isDisposed) == 1)
+                throw new ObjectDisposedException(nameof(LsmEngine));
+
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+
+            lock (_walLock)
+            {
+                _activeWal.Append(1, keyBytes, ReadOnlySpan<byte>.Empty);
+            }
+
+            if (_index.TryGetValue(key, out _))
+                Interlocked.Decrement(ref _totalLiveCount);
+
             _activeMemTable.Delete(key);
-            // Tomstone in index so it masks disk values
-            _index[key] = new IndexRecord { IsMemTable = true };
         }
-        
-        CheckFlush();
-    }
-    
-    public long Count => _index.Count;
-
-    private void CheckFlush()
-    {
-        if (_activeMemTable.Size >= _flushThresholdBytes)
+        finally
         {
-            ThreadPool.QueueUserWorkItem(_ => FlushActiveMemTable());
+            _engineLock.ExitReadLock();
+        }
+
+        if (_activeMemTable.Size >= _flushThresholdBytes)
+            TriggerFlush();
+    }
+
+    public bool TryGet(string key, ValueSpanConsumer consumer)
+    {
+        _engineLock.EnterReadLock();
+        try
+        {
+            if (Volatile.Read(ref _isDisposed) == 1) return false;
+
+            if (!_bloomFilter.MightContain(key))
+                return false;
+
+            if (_activeMemTable.TryGet(key, out bool isDeleted, out byte[] value))
+            {
+                if (isDeleted) return false;
+                consumer(value);
+                return true;
+            }
+
+            foreach (var segId in _flushingMemTables.Keys.OrderByDescending(x => x))
+            {
+                if (_flushingMemTables.TryGetValue(segId, out var flushingTable))
+                {
+                    if (flushingTable.TryGet(key, out isDeleted, out value))
+                    {
+                        if (isDeleted) return false;
+                        consumer(value);
+                        return true;
+                    }
+                }
+            }
+
+            if (_index.TryGetValue(key, out var indexRecord))
+            {
+                if (indexRecord.IsMemTable) return false;
+
+                if (_segments.TryGetValue(indexRecord.SegmentId, out var segment))
+                {
+                    ReadOnlySpan<byte> viewSpan = segment.ReadValue(indexRecord.Offset, indexRecord.Length);
+                    consumer(viewSpan);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        finally
+        {
+            _engineLock.ExitReadLock();
         }
     }
 
-    private void FlushActiveMemTable()
+    private void TriggerFlush()
     {
-        MemTable toFlush;
-        WalWriter oldWal;
-        int newSegmentId;
-        string newWalPath;
-        
+        if (!_flushSemaphore.Wait(0)) return;
+
         lock (_flushLock)
         {
-            if (_activeMemTable.Size < _flushThresholdBytes) return;
+            if (_activeMemTable.Size < _flushThresholdBytes)
+            {
+                _flushSemaphore.Release();
+                return;
+            }
 
-            toFlush = _activeMemTable;
-            oldWal = _activeWal;
-            
-            _nextSegmentId++;
-            newSegmentId = _nextSegmentId;
-            newWalPath = Path.Combine(_dir, $"wal_{newSegmentId}.log");
-            
-            // Swap
-            _flushingMemTables.Enqueue(toFlush);
-            _activeMemTable = new MemTable();
-            _activeWal = new WalWriter(newWalPath);
+            var oldMemTable = _activeMemTable;
+            var oldWal = _activeWal;
+            int currentSegmentId = _nextSegmentId++;
+
+            _flushingMemTables[currentSegmentId] = oldMemTable;
+
+            lock (_walLock)
+            {
+                _activeMemTable = new MemTable(_flushThresholdBytes, _radixTreeCapacity);
+                _activeWal = new WalWriter(Path.Combine(_dir, $"wal_{_nextSegmentId}.log"));
+            }
+
+            Task.Run(() =>
+            {
+                try { FlushMemTableInternal(oldMemTable, currentSegmentId, oldWal); }
+                finally
+                {
+                    _flushSemaphore.Release();
+                }
+            });
         }
+    }
 
+    private void FlushMemTableInternal(MemTable memTable, int newSegmentId, WalWriter oldWal)
+    {
         string sstPath = Path.Combine(_dir, $"segment_{newSegmentId}.sst");
         long currentOffset = 0;
-        
-        // Write SSTable (basic layout: sequences of KeyLen, ValLen, Key, Val)
-        using (var fs = new FileStream(sstPath, FileMode.Create, FileAccess.Write))
+
+        var pendingIndexUpdates = new List<(string Key, IndexRecord Record)>();
+        var snapshot = memTable.GetSnapshot();
+
+        using (var fs = new FileStream(sstPath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024))
         using (var bw = new BinaryWriter(fs))
         {
-            var snapshot = toFlush.GetSnapshot().ToList();
-            
-            // In a real LSM, we'd sort keys. For now, we write and create an index footer.
             foreach (var kvp in snapshot)
             {
-                var kBytes = Encoding.UTF8.GetBytes(kvp.Key);
-                var vBytes = kvp.Value.Value;
-                bool isDeleted = kvp.Value.IsDeleted;
-                
-                // Keep record of offset for the global index
-                long recordOffset = currentOffset; 
-                int recordLength = vBytes.Length; // For value retrieval
-                
-                bw.Write(isDeleted);
+                if (kvp.Value.IsDeleted)
+                {
+                    _index.Remove(kvp.Key);
+                    _bloomFilter.Remove(kvp.Key);
+                    continue;
+                }
+
+                byte[] kBytes = Encoding.UTF8.GetBytes(kvp.Key);
+                ReadOnlySpan<byte> vBytes = memTable.ReadRawArenaValue(kvp.Value.Offset, kvp.Value.Length);
+
+                if (vBytes.IsEmpty) continue;
+
+                bw.Write(false);
                 bw.Write(kBytes.Length);
                 bw.Write(vBytes.Length);
                 bw.Write(kBytes);
-                if (!isDeleted)
-                {
-                    bw.Write(vBytes);
-                }
+                bw.Write(vBytes);
 
-                if (!isDeleted)
-                {
-                    // Calculate value offset (1 + 4 + 4 + kLen)
-                    long valOffset = recordOffset + 9 + kBytes.Length;
-                    var newDiskRecord = new IndexRecord { IsMemTable = false, SegmentId = newSegmentId, Offset = valOffset, Length = recordLength };
-                    
-                    // Update global index if it hasn't been overwritten in memory
-                    _index.AddOrUpdate(kvp.Key, 
-                        key => newDiskRecord,
-                        (key, existing) => 
-                        {
-                            if (existing.IsMemTable && _activeMemTable.TryGet(key, out _, out _))
-                            {
-                                return existing;
-                            }
-                            return newDiskRecord;
-                        });
-                }
-                else
-                {
-                    // Deleted, try remove from index
-                    if (!_activeMemTable.TryGet(kvp.Key, out _, out _))
-                    {
-                        var kvpToRemove = new System.Collections.Generic.KeyValuePair<string, IndexRecord>(kvp.Key, new IndexRecord { IsMemTable = true });
-                        ((System.Collections.Generic.ICollection<System.Collections.Generic.KeyValuePair<string, IndexRecord>>)_index).Remove(kvpToRemove);
-                    }
-                }
+                long valOffset = currentOffset + 1 + 4 + 4 + kBytes.Length;
 
-                currentOffset += 9 + kBytes.Length + (isDeleted ? 0 : vBytes.Length);
+                pendingIndexUpdates.Add((kvp.Key, new IndexRecord
+                {
+                    IsMemTable = false,
+                    SegmentId = newSegmentId,
+                    Offset = valOffset,
+                    Length = vBytes.Length
+                }));
+
+                currentOffset += 1 + 4 + 4 + kBytes.Length + vBytes.Length;
             }
-            
-            // Note: A real SSTable has an index block footer to bootstrap the dictionary at restart.
         }
 
-        var segment = new Segment(newSegmentId, sstPath);
-        _segments[newSegmentId] = segment;
-        
-        // Remove from flushing queue (we only ever have 1 or a few, and they complete in order roughly. For exact removal we can copy to list or ignore for this toy engine)
-        // Since we enqueue and dequeue sequentially in flush blocks
-        _flushingMemTables.TryDequeue(out _);
+        _segments[newSegmentId] = new Segment(newSegmentId, sstPath);
 
-        // Cleanup old WAL
-        oldWal.Dispose();
-        // In real impl, delete the WAL file.
-    }
-    
-    public void Clear()
-    {
-        lock (_flushLock)
+        foreach (var update in pendingIndexUpdates)
         {
-            // Aktif WAL ve Segmentleri kapat
-            _activeWal.Dispose();
-            foreach (var seg in _segments.Values)
-            {
-                seg.Dispose();
-            }
+            _index.Put(update.Key, update.Record);
+        }
 
-            // In-Memory state'i sıfırla
-            _activeMemTable = new MemTable();
-            while (_flushingMemTables.TryDequeue(out _)) { }
-            _index.Clear();
-            _segments.Clear();
+        _engineLock.EnterWriteLock();
+        try
+        {
+            if (Volatile.Read(ref _isDisposed) == 1) return;
 
-            // Diskteki eski WAL ve SSTable dosyalarını sil
-            foreach (var file in Directory.GetFiles(_dir))
+            if (_flushingMemTables.TryRemove(newSegmentId, out var flushedTable))
+                flushedTable.Dispose();
+
+            oldWal?.Dispose();
+            string oldWalPath = Path.Combine(_dir, $"wal_{newSegmentId}.log");
+            if (File.Exists(oldWalPath))
+                try { File.Delete(oldWalPath); } catch { }
+        }
+        finally
+        {
+            _engineLock.ExitWriteLock();
+        }
+    }
+
+    public void ForceClearWalAndIndex()
+    {
+        _engineLock.EnterWriteLock();
+        try
+        {
+            lock (_flushLock)
             {
-                try 
-                { 
-                    File.Delete(file); 
-                } 
-                catch 
-                { 
-                    // İşletim sistemi kaynaklı anlık lock'ları yoksay
+                lock (_walLock)
+                {
+                    _activeWal?.Dispose();
+
+                    foreach (var seg in _segments.Values) seg?.Dispose();
+                    _activeMemTable?.Dispose();
+                    foreach (var t in _flushingMemTables.Values) t?.Dispose();
+
+                    _flushingMemTables.Clear();
+                    _index.Clear();
+                    _bloomFilter.Clear();
+                    _segments.Clear();
+                    Interlocked.Exchange(ref _totalLiveCount, 0);
+
+                    if (Directory.Exists(_dir))
+                    {
+                        foreach (var file in Directory.GetFiles(_dir))
+                            try { File.Delete(file); } catch { }
+                    }
+
+                    _nextSegmentId = 0;
+                    _activeMemTable = new MemTable(_flushThresholdBytes, _radixTreeCapacity);
+                    _activeWal = new WalWriter(Path.Combine(_dir, $"wal_{_nextSegmentId}.log"));
                 }
             }
-
-            // Motoru ilk haline getir
-            _nextSegmentId = 0;
-            string walPath = Path.Combine(_dir, $"wal_{_nextSegmentId}.log");
-            _activeWal = new WalWriter(walPath);
+        }
+        finally
+        {
+            _engineLock.ExitWriteLock();
         }
     }
 
     public void Dispose()
     {
-        _activeWal.Dispose();
-        foreach (var seg in _segments.Values)
+        if (Interlocked.Exchange(ref _isDisposed, 1) == 0)
         {
-            seg.Dispose();
+            _engineLock.EnterWriteLock();
+            try
+            {
+                lock (_walLock)
+                {
+                    _activeWal?.Dispose();
+                }
+
+                if (_activeMemTable?.Size > 0)
+                {
+                    try { FlushMemTableInternal(_activeMemTable, _nextSegmentId++, _activeWal!); } catch { }
+                }
+
+                foreach (var t in _flushingMemTables.Values) t?.Dispose();
+                _flushingMemTables.Clear();
+
+                foreach (var seg in _segments.Values) seg?.Dispose();
+                _segments.Clear();
+
+                _index?.Dispose();
+                _activeMemTable?.Dispose();
+                _flushSemaphore?.Dispose();
+                _bloomFilter?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Dispose error: {ex.Message}");
+            }
+            finally
+            {
+                _engineLock.ExitWriteLock();
+                _engineLock.Dispose();
+            }
         }
+        GC.SuppressFinalize(this);
+    }
+
+    ~LsmEngine()
+    {
+        Dispose();
     }
 }

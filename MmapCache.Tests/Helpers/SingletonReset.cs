@@ -1,13 +1,13 @@
-﻿using System.Reflection;
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
 using MmapCache.Cache;
 
 namespace MmapCache.Tests.Helpers;
 
 /// <summary>
 /// Resets the MmapCacheManager singleton between tests.
-///
-/// MmapCacheManager._instance is a private static field; we reach it via
-/// reflection so each test can call Initialize() with a fresh state.
 /// </summary>
 public static class SingletonReset
 {
@@ -23,8 +23,7 @@ public static class SingletonReset
 }
 
 /// <summary>
-/// Creates a throw-away temp directory for a single test and cleans it up
-/// when the test finishes.  Also resets the singleton before and after.
+/// Creates a throw-away temp directory for a single test and cleans it up.
 /// </summary>
 public sealed class TempCacheDir : IDisposable
 {
@@ -33,7 +32,6 @@ public sealed class TempCacheDir : IDisposable
 
     public TempCacheDir()
     {
-        // Make sure there is no leftover instance from a previous (failed) test.
         DisposeCurrentManager();
         SingletonReset.Reset();
         Directory.CreateDirectory(Path);
@@ -57,14 +55,8 @@ public sealed class TempCacheDir : IDisposable
     }
 }
 
-/// <summary>
-/// Canonical test value type used across all test classes.
-/// </summary>
 public sealed record Widget(string Id, string Label, decimal Price, int Stock);
 
-/// <summary>
-/// Helpers shared by multiple test classes.
-/// </summary>
 public static class TestFactory
 {
     // ── Widget helpers ────────────────────────────────────────────────────────
@@ -92,7 +84,7 @@ public static class TestFactory
             Name = name,
             Supplier = () => MakeWidgets(count, supplierPrefix ?? name.Replace("-", "_")),
             Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
-            Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
+            Deserializer = span => System.Text.Json.JsonSerializer.Deserialize<Widget>(span)!,
             Ttl = ttl ?? TimeSpan.FromHours(1),
             DynamicSizing = dynamicSizing,
             L1MaxSize = l1MaxSize,
