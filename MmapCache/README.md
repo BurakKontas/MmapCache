@@ -69,11 +69,11 @@ using MmapCache.Cache;
 using MmapCache.Config;
 using System.Text.Json;
 
-// -- 1. Initialize once at application startup --------------------------------?
+// -- 1. Initialize once at application startup --------------------------------
 MmapCacheManager.Initialize(
     basePath : "/var/cache/myapp");  // LSM log and sst files are written here
 
-// -- 2. Describe what to store ------------------------------------------------?
+// -- 2. Describe what to store ------------------------------------------------
 var productDef = new MmapCacheDefinition<Product>
 {
     Name = "products",
@@ -84,16 +84,16 @@ var productDef = new MmapCacheDefinition<Product>
     Ttl = TimeSpan.FromHours(1)
 };
 
-// -- 3. Register Engine Instance ----------------------------------------------?
+// -- 3. Register Engine Instance ----------------------------------------------
 // Restores from on-disk SSTables instantly, replays WAL if recovering from a crash.
 MmapCacheManager.Instance.Register(productDef);
 
-// -- 4. Active Mutability (Put/Delete) ----------------------------------------?
+// -- 4. Active Mutability (Put/Delete) ----------------------------------------
 // Mutations are immediately visible and durably piped to the active WAL
 MmapCacheManager.Instance.Put("products", "product_42", new Product("product_42", "Updated!", 9.99m, 50));
 MmapCacheManager.Instance.Delete("products", "product_99");
 
-// -- 5. Concurrent Reads (lock-free logic) ------------------------------------?
+// -- 5. Concurrent Reads (lock-free logic) ------------------------------------
 var product = MmapCacheManager.Instance.Get<Product>("products", "product_42");
 
 if (MmapCacheManager.Instance.TryGet<Product>("products", "product_42", out var p))
@@ -195,8 +195,8 @@ The metrics below represent the performance of the off-heap unmanaged engine und
 
 By leveraging chunked write boundaries past 1M records and implementing a completely off-heap unmanaged `ConcurrentRadixTree`, the operating system physical RAM footprint demonstrates remarkable stability:
 
-- **5M–100M scale (20x growth):** Post-write Working Set remains between **2.56–15.68 MB**
-- Each test iteration **returns to pristine baseline** (~0.8–0.9 MB) after cleanup
+- **5M-100M scale (20x growth):** Post-write Working Set remains between **2.56-15.68 MB**
+- Each test iteration **returns to pristine baseline** (~0.8-0.9 MB) after cleanup
 - No cumulative memory leakage across progressively larger datasets
 
 #### 2. Deterministic O(1)-like Read Latency
@@ -210,7 +210,7 @@ While total read duration naturally scales with dataset size, per-operation late
 | 1M | 1.72 us | 1.40 us | 3.30 us | 5.10 us |
 | 100M | 1.86 us | 1.30 us | 2.20 us | 5.00 us |
 
-**Key takeaway:** After warm-up, read latency stabilizes to **~1.5–1.9 us** average regardless of dataset size. Pointer hopping on unmanaged memory layout, combined with front-facing Bloom Filter evaluations, keeps read speeds isolated from scale degradation.
+**Key takeaway:** After warm-up, read latency stabilizes to **~1.5-1.9 us** average regardless of dataset size. Pointer hopping on unmanaged memory layout, combined with front-facing Bloom Filter evaluations, keeps read speeds isolated from scale degradation.
 
 #### 3. Write Throughput Scaling
 
