@@ -1,9 +1,12 @@
 ﻿using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace MmapCache.Lsm;
+
+public delegate void RadixKeySpanConsumer(ReadOnlySpan<char> keySpan);
 
 /// <summary>
 /// A highly optimized, zero-allocation, off-heap Radix Tree implementation using the 
@@ -102,7 +105,6 @@ public unsafe class ConcurrentRadixTree<T> : IDisposable where T : unmanaged
 
                 if (node.Child == 0)
                 {
-                    // If no children exist, create the first child node directly
                     if (_next >= _capacity) throw new OutOfMemoryException($"Trie capacity exhausted: {_capacity}");
                     int newIdx = _next++;
                     node.Child = newIdx;
@@ -112,7 +114,6 @@ public unsafe class ConcurrentRadixTree<T> : IDisposable where T : unmanaged
                 }
                 else
                 {
-                    // Search horizontally across siblings for a matching edge character
                     int currChild = node.Child;
                     int prevChild = 0;
                     bool found = false;
@@ -132,7 +133,6 @@ public unsafe class ConcurrentRadixTree<T> : IDisposable where T : unmanaged
 
                     if (!found)
                     {
-                        // Character not found among siblings; append it to the end of the sibling chain
                         if (_next >= _capacity) throw new OutOfMemoryException($"Trie capacity exhausted: {_capacity}");
                         int newNodeIdx = _next++;
                         ref Node prevNode = ref GetNode(prevChild);
@@ -248,10 +248,6 @@ public unsafe class ConcurrentRadixTree<T> : IDisposable where T : unmanaged
         return ToKeyValuePairList();
     }
 
-    /// <summary>
-    /// 🔥 FIX: LsmEngine.cs tarafındaki memTable.GetSnapshot() kilit mekanizmasının 
-    /// beklediği güncel ve uyumlu metot ismi.
-    /// </summary>
     public List<KeyValuePair<string, T>> ToKeyValuePairList()
     {
         if (Volatile.Read(ref _isDisposed) == 1) return new List<KeyValuePair<string, T>>();
@@ -260,7 +256,6 @@ public unsafe class ConcurrentRadixTree<T> : IDisposable where T : unmanaged
         _treeLock.EnterReadLock();
         try
         {
-            // String birleştirmelerini (GC Allocation) önlemek için max 512 karakterlik kiralık buffer alanı
             char* buffer = stackalloc char[512];
             TraverseOptimized(0, buffer, 0, result);
         }
@@ -271,18 +266,12 @@ public unsafe class ConcurrentRadixTree<T> : IDisposable where T : unmanaged
         return result;
     }
 
-    /// <summary>
-    /// 🔥 OPTIMIZATION: Önceki sürümdeki `prefix + char` mantığı her adımda yeni string oluşturup
-    /// Garbage Collector (GC) üzerinde devasa yük bindiriyordu. Bu pointer tabanlı traverse sürümü 
-    /// sıfır allocation (Zero-Allocation) ile çalışır.
-    /// </summary>
     private void TraverseOptimized(int index, char* buffer, int depth, List<KeyValuePair<string, T>> result)
     {
         ref Node node = ref GetNode(index);
 
         if (index != 0 && node.HasValue)
         {
-            // Sadece terminal (değer içeren) düğümlere gelindiğinde tek bir string oluşturulur
             string key = new string(buffer, 0, depth);
             result.Add(new KeyValuePair<string, T>(key, node.Value));
         }
@@ -292,7 +281,6 @@ public unsafe class ConcurrentRadixTree<T> : IDisposable where T : unmanaged
         {
             ref Node childNode = ref GetNode(currChild);
 
-            // Karakteri derinliğe göre buffer'a güvenle yazıp bir alt kırılıma iniyoruz
             if (depth < 512)
             {
                 buffer[depth] = (char)childNode.KeyChar;
@@ -302,6 +290,183 @@ public unsafe class ConcurrentRadixTree<T> : IDisposable where T : unmanaged
             currChild = childNode.Sibling;
         }
     }
+
+    /// <summary>
+    /// 🔥 NEW OPTIMIZATION: Belirtilen öneke (prefix) göre ağacı sıfır allocation ile push-tabanlı tarar.
+    /// Eğer prefix null veya boş string ("") ise tüm ağaç taranır.
+    /// </summary>
+    public void ScanPrefixZeroAlloc(string prefix, RadixKeySpanConsumer consumer)
+    {
+        if (Volatile.Read(ref _isDisposed) == 1) return;
+
+        char* buffer = stackalloc char[512];
+
+        int index = 0;
+        int depth = 0;
+
+        _treeLock.EnterReadLock();
+        try
+        {
+            if (!string.IsNullOrEmpty(prefix))
+            {
+                for (int i = 0; i < prefix.Length; i++)
+                {
+                    byte c = (byte)prefix[i];
+
+                    ref Node node = ref GetNode(index);
+                    int currChild = node.Child;
+
+                    bool found = false;
+
+                    while (currChild != 0)
+                    {
+                        ref Node childNode = ref GetNode(currChild);
+
+                        if (childNode.KeyChar == c)
+                        {
+                            index = currChild;
+                            buffer[depth++] = (char)c;
+                            found = true;
+                            break;
+                        }
+
+                        currChild = childNode.Sibling;
+                    }
+
+                    if (!found)
+                        return;
+                }
+
+                TraversePrefixScanZeroAlloc(index, buffer, depth, consumer);
+            }
+        }
+        finally
+        {
+            _treeLock.ExitReadLock();
+        }
+    }
+
+    private void TraversePrefixScanZeroAlloc(int index, char* buffer, int depth, RadixKeySpanConsumer consumer)
+    {
+        ref Node node = ref GetNode(index);
+
+        if (index != 0 && node.HasValue)
+        {
+            consumer(new ReadOnlySpan<char>(buffer, depth));
+        }
+
+        int currChild = node.Child;
+
+        while (currChild != 0)
+        {
+            ref Node childNode = ref GetNode(currChild);
+
+            if (depth < 512)
+            {
+                buffer[depth] = (char)childNode.KeyChar;
+                TraversePrefixScanZeroAlloc(currChild, buffer, depth + 1, consumer);
+            }
+
+            currChild = childNode.Sibling;
+        }
+    }
+
+    /// <summary>
+    /// 🔥 NEW OPTIMIZATION: Belirtilen öneke (prefix) göre ağacı pull-tabanlı lazy iterator ile gezer.
+    /// State machine sınırlamalarını aşmak için IntPtr güvenli alan adreslemesi barındırır.
+    /// </summary>
+    public IEnumerable<string> EnumerateKeysPrefixLazy(string prefix)
+    {
+        if (Volatile.Read(ref _isDisposed) == 1) yield break;
+
+        _treeLock.EnterReadLock();
+        try
+        {
+            char[] buffer = ArrayPool<char>.Shared.Rent(512);
+
+            try
+            {
+                int index = 0;
+                int depth = 0;
+
+                if (!string.IsNullOrEmpty(prefix))
+                {
+                    for (int i = 0; i < prefix.Length; i++)
+                    {
+                        byte c = (byte)prefix[i];
+
+                        Node node = GetNode(index); // FIX: ref removed
+                        int currChild = node.Child;
+
+                        bool found = false;
+
+                        while (currChild != 0)
+                        {
+                            Node childNode = GetNode(currChild);
+
+                            if (childNode.KeyChar == c)
+                            {
+                                index = currChild;
+
+                                if (depth < 512)
+                                    buffer[depth++] = (char)c;
+
+                                found = true;
+                                break;
+                            }
+
+                            currChild = childNode.Sibling;
+                        }
+
+                        if (!found)
+                            yield break;
+                    }
+                }
+
+                foreach (var key in EnumerateKeysPrefixInternal(index, buffer, depth))
+                    yield return key;
+            }
+            finally
+            {
+                ArrayPool<char>.Shared.Return(buffer);
+            }
+        }
+        finally
+        {
+            _treeLock.ExitReadLock();
+        }
+    }
+
+    private IEnumerable<string> EnumerateKeysPrefixInternal(int index, char[] buffer, int depth)
+    {
+        Node node = GetNode(index);
+
+        if (index != 0 && node.HasValue)
+        {
+            yield return new string(buffer, 0, depth);
+        }
+
+        int currChild = node.Child;
+
+        while (currChild != 0)
+        {
+            Node childNode = GetNode(currChild);
+
+            if (depth < 512)
+            {
+                buffer[depth] = (char)childNode.KeyChar;
+
+                foreach (var key in EnumerateKeysPrefixInternal(currChild, buffer, depth + 1))
+                    yield return key;
+            }
+
+            currChild = childNode.Sibling;
+        }
+    }
+
+    // Eski global/genel scan metotları uyumluluk adına yönlendirildi
+    public void ScanZeroAlloc(RadixKeySpanConsumer consumer, string prefix = "") => ScanPrefixZeroAlloc(prefix, consumer);
+    public IEnumerable<string> EnumerateKeysLazy(string prefix = "") => EnumerateKeysPrefixLazy(prefix);
 
     public void Clear()
     {

@@ -18,11 +18,11 @@ public sealed class EndToEndTests
     {
         _output = output;
 
-#if DEBUG
-        _isDebugMode = true;
-#else
-        _isDebugMode = false;
-#endif
+        #if DEBUG
+            _isDebugMode = true;
+        #else
+            _isDebugMode = false;
+        #endif
     }
 
     [DllImport("kernel32.dll")]

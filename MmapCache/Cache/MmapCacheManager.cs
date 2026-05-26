@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -232,6 +232,33 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
             engine.Put(kvp.Key, payload);
         }
+    }
+
+    //foreach (string key in MmapCacheManager.Instance.ScanKeys("user_sessions"))
+    //{
+    //    Console.WriteLine(key); 
+    //}
+    public IEnumerable<string> ScanKeys(string cacheName, string prefix = "")
+    {
+        if (!_engines.TryGetValue(cacheName, out var engine))
+            return Array.Empty<string>();
+
+        return engine.EnumerateKeys(prefix);
+    }
+
+    // MmapCacheManager.Instance.ScanKeysZeroAlloc("user_sessions", (ReadOnlySpan<char> keySpan) => 
+    // {
+    //    if (keySpan.StartsWith("auth_"))
+    //    {
+    //        // ops
+    //    }
+    // });
+    public void ScanKeysZeroAlloc(string cacheName, RadixKeySpanConsumer consumer, string prefix = "")
+    {
+        if (!_engines.TryGetValue(cacheName, out var engine))
+            return;
+
+        engine.ScanKeysZeroAlloc(consumer, prefix);
     }
 
     public ValueTask DisposeAsync()

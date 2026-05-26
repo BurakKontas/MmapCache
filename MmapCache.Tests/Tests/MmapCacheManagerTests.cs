@@ -278,4 +278,145 @@ public sealed class MmapCacheManagerTests
         var val2 = mgr2.Get<Widget>("w", "w_0");
         Assert.NotNull(val2);
     }
+
+    [Fact]
+    public void ScanKeys_ReturnsAllKeys_WhenPrefixEmpty()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        mgr.Register(TestFactory.WidgetDef("scan", count: 10));
+
+        var keys = mgr.ScanKeys("scan").ToList();
+
+        Assert.Equal(10, keys.Count);
+        Assert.Contains("scan_0", keys);
+        Assert.Contains("scan_9", keys);
+    }
+
+    [Fact]
+    public void ScanKeys_ReturnsFilteredKeys_WithPrefix()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        mgr.Register(TestFactory.WidgetDef("scan", count: 20));
+
+        var keys = mgr.ScanKeys("scan", "scan_1").ToList();
+
+        Assert.All(keys, k => Assert.StartsWith("scan_1", k));
+
+        // örn: scan_1, scan_10-19
+        Assert.Contains("scan_1", keys);
+    }
+
+    [Fact]
+    public void ScanKeys_ReturnsEmpty_ForUnknownCache()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        var keys = mgr.ScanKeys("ghost").ToList();
+
+        Assert.Empty(keys);
+    }
+
+    [Fact]
+    public void ScanKeys_ReflectsInsertedKeys_Dynamically()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        mgr.Register(TestFactory.WidgetDef("dyn", count: 5));
+
+        mgr.Put("dyn", "extra_key_1", new Widget("extra_key_1", "x", 1, 1));
+        mgr.Put("dyn", "extra_key_2", new Widget("extra_key_2", "x", 1, 1));
+
+        var keys = mgr.ScanKeys("dyn").ToList();
+
+        Assert.Contains("extra_key_1", keys);
+        Assert.Contains("extra_key_2", keys);
+    }
+
+    [Fact]
+    public void ScanKeysZeroAlloc_InvokesConsumer_ForAllKeys()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        mgr.Register(TestFactory.WidgetDef("zscan", count: 15));
+
+        var seen = new HashSet<string>();
+
+        mgr.ScanKeysZeroAlloc("zscan", span =>
+        {
+            seen.Add(span.ToString());
+        });
+
+        Assert.Equal(15, seen.Count);
+        Assert.Contains("zscan_0", seen);
+        Assert.Contains("zscan_14", seen);
+    }
+
+    [Fact]
+    public void ScanKeysZeroAlloc_FiltersByPrefix()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        mgr.Register(TestFactory.WidgetDef("zscan", count: 50));
+
+        var seen = new List<string>();
+
+        mgr.ScanKeysZeroAlloc("zscan", span =>
+        {
+            seen.Add(span.ToString());
+        }, prefix: "zscan_4");
+
+        Assert.All(seen, k => Assert.StartsWith("zscan_4", k));
+        Assert.Contains("zscan_4", seen);
+    }
+
+    [Fact]
+    public void ScanKeys_IsSafe_DuringConcurrentWrites()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        mgr.Register(TestFactory.WidgetDef("cscan", count: 200));
+
+        var running = true;
+        int scanHits = 0;
+
+        var writer = Task.Run(() =>
+        {
+            var rnd = new Random(1);
+
+            while (Volatile.Read(ref running))
+            {
+                mgr.Put("cscan", $"cscan_{rnd.Next(200)}",
+                    new Widget("x", "y", 1, 1));
+            }
+        });
+
+        var reader = Task.Run(() =>
+        {
+            while (Volatile.Read(ref running))
+            {
+                foreach (var k in mgr.ScanKeys("cscan"))
+                {
+                    if (k != null)
+                        Interlocked.Increment(ref scanHits);
+                }
+            }
+        });
+
+        Task.Delay(100).Wait();
+
+        Volatile.Write(ref running, false);
+
+        Task.WaitAll(writer, reader);
+
+        Assert.True(scanHits > 0);
+    }
 }

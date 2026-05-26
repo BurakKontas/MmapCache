@@ -18,42 +18,42 @@ public delegate void ValueSpanConsumer(ReadOnlySpan<byte> valueSpan);
 /// </summary>
 public unsafe class LsmEngine : IDisposable
 {
-/// <summary>
-/// The currently active MemTable accepting new writes.
-/// </summary>
-private MemTable _activeMemTable;
+    /// <summary>
+    /// The currently active MemTable accepting new writes.
+    /// </summary>
+    private MemTable _activeMemTable;
 
-/// <summary>
-/// MemTables currently in the process of being flushed to disk. Keys in here remain readable.
-/// </summary>
-private readonly ConcurrentDictionary<int, MemTable> _flushingMemTables = new();
+    /// <summary>
+    /// MemTables currently in the process of being flushed to disk. Keys in here remain readable.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, MemTable> _flushingMemTables = new();
 
-/// <summary>
-/// Write-Ahead Log for durable persistence prior to flushing. 
-/// </summary>
-private WalWriter _activeWal;
+    /// <summary>
+    /// Write-Ahead Log for durable persistence prior to flushing. 
+    /// </summary>
+    private WalWriter _activeWal;
 
-/// <summary>
-/// BloomFilter allowing 0-IO misses for non-existent keys.
-/// </summary>
-private readonly BloomFilter _bloomFilter;
+    /// <summary>
+    /// BloomFilter allowing 0-IO misses for non-existent keys.
+    /// </summary>
+    private readonly BloomFilter _bloomFilter;
 
-/// <summary>
-/// The global unmanaged radix index for all memory and disk segments.
-/// </summary>
-private readonly ConcurrentRadixTree<IndexRecord> _index;
+    /// <summary>
+    /// The global unmanaged radix index for all memory and disk segments.
+    /// </summary>
+    private readonly ConcurrentRadixTree<IndexRecord> _index;
 
-/// <summary>
-/// Tracks all active Memory-Mapped SSTable segments currently on disk.
-/// </summary>
-private readonly ConcurrentDictionary<int, Segment> _segments = new();
+    /// <summary>
+    /// Tracks all active Memory-Mapped SSTable segments currently on disk.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, Segment> _segments = new();
 
-private readonly object _flushLock = new();
+    private readonly object _flushLock = new();
 
-/// <summary>
-/// Backpressure semaphore limiting max concurrent background flush tasks.
-/// </summary>
-private readonly SemaphoreSlim _flushSemaphore = new(initialCount: 2, maxCount: 2);
+    /// <summary>
+    /// Backpressure semaphore limiting max concurrent background flush tasks.
+    /// </summary>
+    private readonly SemaphoreSlim _flushSemaphore = new(initialCount: 2, maxCount: 2);
     private readonly ReaderWriterLockSlim _engineLock = new(LockRecursionPolicy.NoRecursion);
     private readonly object _walLock = new();
 
@@ -388,6 +388,82 @@ private readonly SemaphoreSlim _flushSemaphore = new(initialCount: 2, maxCount: 
         finally
         {
             _engineLock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>Returns all live keys from active MemTable, flushing MemTables, and segments.</summary>
+    private IEnumerable<string> GetUnifiedKeys(string prefix)
+    {
+        var seen = new HashSet<string>();
+
+        // 1. Active MemTable (most recent)
+        foreach (var key in GetKeysFromMemTable(_activeMemTable, prefix, seen))
+            yield return key;
+
+        // 2. Flushing MemTables (ordered by segment id descending → newer first)
+        var flushingCopy = _flushingMemTables.OrderByDescending(kvp => kvp.Key).ToList();
+        foreach (var (_, mt) in flushingCopy)
+        {
+            foreach (var key in GetKeysFromMemTable(mt, prefix, seen))
+                yield return key;
+        }
+
+        // 3. Segments (oldest)
+        foreach (var key in _index.EnumerateKeysLazy(prefix))
+        {
+            if (seen.Add(key))
+                yield return key;
+        }
+    }
+
+    /// <summary>Enumerates live (non‑deleted) keys from a single MemTable, filtered by prefix.</summary>
+    private IEnumerable<string> GetKeysFromMemTable(MemTable mt, string prefix, HashSet<string> seen)
+    {
+        foreach (var kvp in mt.GetSnapshot())
+        {
+            if (kvp.Value.IsDeleted) continue;
+            if (!string.IsNullOrEmpty(prefix) && !kvp.Key.StartsWith(prefix))
+                continue;
+            if (seen.Add(kvp.Key))
+                yield return kvp.Key;
+        }
+    }
+
+    /// <summary>
+    /// Enumerates all keys (with optional prefix filter) from the entire LSM tree.
+    /// </summary>
+    public IEnumerable<string> EnumerateKeys(string prefix = "")
+    {
+        _engineLock.EnterReadLock();
+        try
+        {
+            if (Volatile.Read(ref _isDisposed) == 1)
+                yield break;
+            foreach (var key in GetUnifiedKeys(prefix))
+                yield return key;
+        }
+        finally
+        {
+            _engineLock.ExitReadLock();
+        }
+    }
+
+    /// <summary>
+    /// Zero‑allocation scan of keys (with optional prefix filter) from the entire LSM tree.
+    /// </summary>
+    public void ScanKeysZeroAlloc(RadixKeySpanConsumer consumer, string prefix = "")
+    {
+        _engineLock.EnterReadLock();
+        try
+        {
+            if (Volatile.Read(ref _isDisposed) == 1)
+                return;
+            foreach (var key in GetUnifiedKeys(prefix))
+                consumer(key.AsSpan());
+        }
+        finally
+        {
+            _engineLock.ExitReadLock();
         }
     }
 
