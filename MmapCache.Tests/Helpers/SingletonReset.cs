@@ -82,7 +82,7 @@ public static class TestFactory
         new()
         {
             Name = name,
-            Supplier = () => MakeWidgets(count, supplierPrefix ?? name.Replace("-", "_")),
+            Supplier = (ct) => MakeWidgets(count, supplierPrefix ?? name.Replace("-", "_")),
             Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
             Deserializer = span => System.Text.Json.JsonSerializer.Deserialize<Widget>(span)!,
             Ttl = ttl ?? TimeSpan.FromHours(1),

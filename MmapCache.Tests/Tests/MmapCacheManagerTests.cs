@@ -169,7 +169,7 @@ public sealed class MmapCacheManagerTests
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
-            Supplier = () =>
+            Supplier = (ct) =>
             {
                 supplierCalls++;
                 if (supplierCalls == 1) return TestFactory.MakeWidgets(1, "w");
@@ -216,7 +216,7 @@ public sealed class MmapCacheManagerTests
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
-            Supplier = () =>
+            Supplier = (ct) =>
             {
                 Interlocked.Increment(ref supplierCalls);
                 // Simulate a slow data source so the reload window is wide.
@@ -294,7 +294,7 @@ public sealed class MmapCacheManagerTests
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
-            Supplier = () =>
+            Supplier = (ct) =>
             {
                 callCount++;
                 if (callCount > 1) throw new InvalidOperationException("Supplier exploded");
@@ -359,7 +359,7 @@ public sealed class MmapCacheManagerTests
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
-            Supplier = () =>
+            Supplier = (ct) =>
             {
                 Thread.Sleep(200);
                 return TestFactory.MakeWidgets(5, "w");
@@ -393,14 +393,14 @@ public sealed class MmapCacheManagerTests
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "a",
-            Supplier = () => { Thread.Sleep(100); return TestFactory.MakeWidgets(3, "a"); },
+            Supplier = (ct) => { Thread.Sleep(100); return TestFactory.MakeWidgets(3, "a"); },
             Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
             Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
         });
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "b",
-            Supplier = () => { Thread.Sleep(100); return TestFactory.MakeWidgets(3, "b"); },
+            Supplier = (ct) => { Thread.Sleep(100); return TestFactory.MakeWidgets(3, "b"); },
             Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
             Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
         });
@@ -501,7 +501,7 @@ public sealed class MmapCacheManagerTests
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
-            Supplier = () =>
+            Supplier = (ct) =>
             {
                 Interlocked.Increment(ref supplierCalls);
                 if (supplierCalls == 1)
@@ -592,7 +592,7 @@ public sealed class MmapCacheManagerTests
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
-            Supplier = () =>
+            Supplier = (ct) =>
             {
                 Interlocked.Increment(ref supplierCalls);
                 return TestFactory.MakeWidgets(5, "w");
@@ -611,7 +611,7 @@ public sealed class MmapCacheManagerTests
         mgr2.Register(new MmapCacheDefinition<Widget>
         {
             Name = "w",
-            Supplier = () =>
+            Supplier = (ct) =>
             {
                 Interlocked.Increment(ref supplierCalls);
                 return TestFactory.MakeWidgets(5, "w");

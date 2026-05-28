@@ -36,7 +36,7 @@ public sealed class MmapCacheConcurrencyStressTests : IDisposable
         manager.Register(new MmapCacheDefinition<Widget>
         {
             Name = _cacheName,
-            Supplier = () => TestFactory.MakeWidgets(InitialRecordCount, "init_widget"),
+            Supplier = (ct) => TestFactory.MakeWidgets(InitialRecordCount, "init_widget"),
             Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
             Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
             Ttl = TimeSpan.FromMinutes(30),

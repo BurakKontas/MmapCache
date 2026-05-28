@@ -17,8 +17,8 @@ public sealed class MmapCacheDefinition<TValue> : ICacheDefinition
     /// Produces the full dataset on every reload.
     /// Yielding lazily (yield return) avoids loading everything into a list upfront.
     /// </summary>
-    public required Func<IEnumerable<(string Key, TValue Value)>> Supplier { get; init; }
-
+    public required Func<CancellationToken, IEnumerable<(string Key, TValue Value)>> Supplier { get; init; }
+    
     /// <summary>Serialize TValue → bytes written into the shard file.</summary>
     public required Func<TValue, byte[]> Serializer { get; init; }
 

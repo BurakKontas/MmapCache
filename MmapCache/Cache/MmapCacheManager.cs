@@ -72,7 +72,7 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
     // ── Registration ──────────────────────────────────────────────────────────
 
-    public void Register<TValue>(MmapCacheDefinition<TValue> def)
+    public void Register<TValue>(MmapCacheDefinition<TValue> def, CancellationToken ct = default!)
     {
         _defs[def.Name] = def;
 
@@ -90,23 +90,20 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
         if (!recovered)
         {
-            var data = def.Supplier();
-            if (data != null)
+            var data = def.Supplier(ct);
+            foreach (var kvp in data)
             {
-                foreach (var kvp in data)
-                {
-                    byte[] valBytes = def.Serializer(kvp.Value);
+                byte[] valBytes = def.Serializer(kvp.Value);
 
-                    long expireTicks = def.Ttl > TimeSpan.Zero
-                        ? (DateTime.UtcNow + def.Ttl).Ticks
-                        : 0;
+                long expireTicks = def.Ttl > TimeSpan.Zero
+                    ? (DateTime.UtcNow + def.Ttl).Ticks
+                    : 0;
 
-                    byte[] payload = new byte[8 + valBytes.Length];
-                    BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(0, 8), expireTicks);
-                    valBytes.CopyTo(payload.AsSpan(8));
+                byte[] payload = new byte[8 + valBytes.Length];
+                BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(0, 8), expireTicks);
+                valBytes.CopyTo(payload.AsSpan(8));
 
-                    engine.Put(kvp.Key, payload);
-                }
+                engine.Put(kvp.Key, payload);
             }
         }
 
@@ -313,7 +310,7 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
     private void LoadFromSupplier<TValue>(MmapCacheDefinition<TValue> def, LsmEngine engine, CancellationToken ct = default)
     {
-        var data = def.Supplier();
+        var data = def.Supplier(ct);
         if (data == null) return;
 
         foreach (var kvp in data)

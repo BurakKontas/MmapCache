@@ -48,7 +48,7 @@ public sealed class EndToEndTests
     private static MmapCacheDefinition<Product> ProductDef(int count) => new()
     {
         Name = "products",
-        Supplier = () => GenerateProducts(count),
+        Supplier = (ct) => GenerateProducts(count),
         Serializer = p => JsonSerializer.SerializeToUtf8Bytes(p),
         Deserializer = b => JsonSerializer.Deserialize<Product>(b)!,
         Ttl = TimeSpan.FromMinutes(5),
@@ -150,7 +150,7 @@ public sealed class EndToEndTests
         manager2.Register(new MmapCacheDefinition<Product>
         {
             Name = "products",
-            Supplier = () =>
+            Supplier = (ct) =>
             {
                 Interlocked.Increment(ref secondRunSupplierCalls);
                 return GenerateProducts(ProductCount);
@@ -180,7 +180,7 @@ public sealed class EndToEndTests
         mgr.Register(new MmapCacheDefinition<Widget>
         {
             Name = "ttl-test",
-            Supplier = Enumerable.Empty<(string, Widget)>,
+            Supplier = (ct) => Enumerable.Empty<(string, Widget)>(),
             Serializer = w => JsonSerializer.SerializeToUtf8Bytes(w),
             Deserializer = b => JsonSerializer.Deserialize<Widget>(b)!,
             Ttl = TimeSpan.FromHours(1)
@@ -303,7 +303,7 @@ public sealed class EndToEndTests
             manager.Register(new MmapCacheDefinition<Product>
             {
                 Name = "benchmark",
-                Supplier = () => Enumerable.Empty<(string, Product)>(),
+                Supplier = (ct) => Enumerable.Empty<(string, Product)>(),
                 Serializer = p => JsonSerializer.SerializeToUtf8Bytes(p),
                 Deserializer = b => JsonSerializer.Deserialize<Product>(b)!,
                 RadixTreeCapacity = treeCapacity,
