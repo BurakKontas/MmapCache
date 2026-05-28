@@ -343,6 +343,224 @@ public sealed class MmapCacheManagerTests
         Assert.False(Directory.Exists(Path.Combine(tmp.Path, "w_v1")), "v1 must be cleaned up after grace period");
     }
 
+    // ── ReloadAsync: concurrent reload guard ──────────────────────────────────
+
+    /// <summary>
+    /// Two simultaneous ReloadAsync calls for the same cache: the second one must
+    /// throw InvalidOperationException immediately, while the first completes normally.
+    /// </summary>
+    [Fact]
+    public async Task ReloadAsync_ConcurrentReload_SecondThrowsAlreadyReloading()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        // Slow supplier so the first reload is still in-flight when the second starts.
+        mgr.Register(new MmapCacheDefinition<Widget>
+        {
+            Name = "w",
+            Supplier = () =>
+            {
+                Thread.Sleep(200);
+                return TestFactory.MakeWidgets(5, "w");
+            },
+            Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
+            Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
+        });
+
+        // Fire the first reload and immediately attempt a second one.
+        var first = mgr.ReloadAsync<Widget>("w");
+        var second = mgr.ReloadAsync<Widget>("w"); // must throw without waiting
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second);
+        Assert.Contains("already being reloaded", ex.Message);
+
+        // First reload must still succeed.
+        await first;
+        Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
+    }
+
+    /// <summary>
+    /// Different caches are independent: two simultaneous reloads for different
+    /// caches must both succeed without interfering with each other.
+    /// </summary>
+    [Fact]
+    public async Task ReloadAsync_ConcurrentReload_DifferentCaches_BothSucceed()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        mgr.Register(new MmapCacheDefinition<Widget>
+        {
+            Name = "a",
+            Supplier = () => { Thread.Sleep(100); return TestFactory.MakeWidgets(3, "a"); },
+            Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
+            Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
+        });
+        mgr.Register(new MmapCacheDefinition<Widget>
+        {
+            Name = "b",
+            Supplier = () => { Thread.Sleep(100); return TestFactory.MakeWidgets(3, "b"); },
+            Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
+            Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
+        });
+
+        // Both reloads in flight at the same time — different caches, must not block each other.
+        await Task.WhenAll(
+            mgr.ReloadAsync<Widget>("a"),
+            mgr.ReloadAsync<Widget>("b"));
+
+        Assert.NotNull(mgr.Get<Widget>("a", "a_0"));
+        Assert.NotNull(mgr.Get<Widget>("b", "b_0"));
+    }
+
+    /// <summary>
+    /// After a reload finishes (or is cancelled), the guard must be released so a
+    /// subsequent reload can start without throwing.
+    /// </summary>
+    [Fact]
+    public async Task ReloadAsync_AfterFirstReloadFinishes_SecondReloadSucceeds()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+        mgr.Register(TestFactory.WidgetDef("w", count: 5));
+
+        await mgr.ReloadAsync<Widget>("w");  // first
+        await mgr.ReloadAsync<Widget>("w");  // second — guard must have been released
+
+        Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
+    }
+
+    /// <summary>
+    /// Even when the first reload is cancelled, the guard must be released so the
+    /// next call can proceed.
+    /// </summary>
+    [Fact]
+    public async Task ReloadAsync_AfterCancelledReload_GuardIsReleased_NextReloadSucceeds()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+        mgr.Register(TestFactory.WidgetDef("w", count: 5));
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => mgr.ReloadAsync<Widget>("w", cts.Token));
+
+        // Guard released — this must not throw "already reloading".
+        await mgr.ReloadAsync<Widget>("w");
+        Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
+    }
+
+    // ── ReloadAsync: cancellation ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Cancelling before the supplier starts: the new versioned directory must not
+    /// exist and the old engine must continue serving data unchanged.
+    /// </summary>
+    [Fact]
+    public async Task ReloadAsync_CancelledBeforeSupplierStarts_OldEngineIntact_NewDirAbsent()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+        mgr.Register(TestFactory.WidgetDef("w", count: 5));
+
+        Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
+
+        // Cancel before calling ReloadAsync — token is already cancelled.
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => mgr.ReloadAsync<Widget>("w", cts.Token));
+
+        // Old engine is intact.
+        Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
+        Assert.Equal(5L, mgr.Size("w"));
+
+        // Shadow directory was cleaned up (or was never created).
+        Assert.False(Directory.Exists(Path.Combine(tmp.Path, "w_v1")),
+            "w_v1 must be absent after a cancelled reload");
+    }
+
+    /// <summary>
+    /// Cancelling mid-supplier: the reload was cancelled while the supplier was
+    /// writing records. The new version directory must be removed and the old
+    /// engine must be left fully intact.
+    /// </summary>
+    [Fact]
+    public async Task ReloadAsync_CancelledMidSupplier_OldEngineIntact_NewDirCleaned()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+
+        using var cts = new CancellationTokenSource();
+        int supplierCalls = 0;
+
+        mgr.Register(new MmapCacheDefinition<Widget>
+        {
+            Name = "w",
+            Supplier = () =>
+            {
+                Interlocked.Increment(ref supplierCalls);
+                if (supplierCalls == 1)
+                    return TestFactory.MakeWidgets(5, "w");
+
+                // On the reload call cancel mid-enumeration so that
+                // ThrowIfCancellationRequested() inside LoadFromSupplier fires.
+                cts.Cancel();
+                return TestFactory.MakeWidgets(100, "w");
+            },
+            Serializer = w => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(w),
+            Deserializer = b => System.Text.Json.JsonSerializer.Deserialize<Widget>(b)!,
+        });
+
+        Assert.Equal(1, supplierCalls);
+        Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => mgr.ReloadAsync<Widget>("w", cts.Token));
+
+        // Old engine still serves data.
+        Assert.NotNull(mgr.Get<Widget>("w", "w_0"));
+        Assert.Equal(5L, mgr.Size("w"));
+
+        // New versioned directory must have been cleaned up.
+        Assert.False(Directory.Exists(Path.Combine(tmp.Path, "w_v1")),
+            "w_v1 must be cleaned up after a mid-supplier cancellation");
+    }
+
+    /// <summary>
+    /// A cancelled reload must not advance _engineVersions: the next successful
+    /// ReloadAsync must still produce v1, not v2.
+    /// </summary>
+    [Fact]
+    public async Task ReloadAsync_CancelledReload_DoesNotAdvanceVersion()
+    {
+        using var tmp = new TempCacheDir();
+        var mgr = MmapCacheManager.Initialize(tmp.Path);
+        mgr.Register(TestFactory.WidgetDef("w", count: 5));
+
+        // v0 exists after initial Register.
+        Assert.True(Directory.Exists(Path.Combine(tmp.Path, "w_v0")));
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => mgr.ReloadAsync<Widget>("w", cts.Token));
+
+        // Version counter must NOT have moved — the next real reload produces v1.
+        await mgr.ReloadAsync<Widget>("w");
+        await Task.Delay(400); // grace-period for old dir cleanup
+
+        Assert.True(Directory.Exists(Path.Combine(tmp.Path, "w_v1")),
+            "First successful reload must land at v1, not v2");
+        Assert.False(Directory.Exists(Path.Combine(tmp.Path, "w_v0")),
+            "v0 must be cleaned up after the successful reload");
+    }
+
     // ── TTL / expiry ──────────────────────────────────────────────────────────
 
     [Fact]

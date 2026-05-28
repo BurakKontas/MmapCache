@@ -37,6 +37,14 @@ public sealed class MmapCacheManager : IAsyncDisposable
     /// </summary>
     private readonly ConcurrentDictionary<string, int> _engineVersions = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Per-cache reload guard: a cache name is present while its ReloadAsync is in flight.
+    /// A second concurrent ReloadAsync call for the same cache throws immediately.
+    /// <see cref="ConcurrentDictionary{TKey,TValue}.TryAdd"/> is atomic, so no further
+    /// synchronisation is needed.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _activeReloads = new(StringComparer.Ordinal);
+
     private MmapCacheManager(string basePath)
     {
         _basePath = basePath;
@@ -240,6 +248,25 @@ public sealed class MmapCacheManager : IAsyncDisposable
         if (!_engines.TryGetValue(cache, out var oldEngine)) return;
         var def = GetDef<TValue>(cache);
 
+        // Reject concurrent reloads for the same cache.  Two simultaneous reloads
+        // would write to the same versioned directory with separate LsmEngine
+        // instances, corrupt LSM files, and double-dispose the retiring engine.
+        if (!_activeReloads.TryAdd(cache, 0))
+            throw new InvalidOperationException(
+                $"Cache '{cache}' is already being reloaded. Wait for the current reload to finish or cancel other reload request before starting another.");
+
+        try
+        {
+            await ReloadCoreAsync(def, cache, oldEngine, ct);
+        }
+        finally
+        {
+            _activeReloads.TryRemove(cache, out _);
+        }
+    }
+
+    private async Task ReloadCoreAsync<TValue>(MmapCacheDefinition<TValue> def, string cache, LsmEngine oldEngine, CancellationToken ct)
+    {
         int oldVersion = _engineVersions.GetOrAdd(cache, 0);
         int newVersion = oldVersion + 1;
         string newDir = GetEngineDir(cache, newVersion);
@@ -252,10 +279,15 @@ public sealed class MmapCacheManager : IAsyncDisposable
         try
         {
             await Task.Run(() => LoadFromSupplier(def, newEngine, ct), ct);
+
+            // Guard against cancellations that arrive after the supplier finishes
+            // but before the atomic swap — we must still roll back in that case.
+            ct.ThrowIfCancellationRequested();
         }
         catch
         {
-            // If population fails, discard the shadow engine and leave old one intact.
+            // Covers both supplier failures and cancellation at any point.
+            // Old engine is untouched; shadow engine and its directory are discarded.
             newEngine.Dispose();
             try { if (Directory.Exists(newDir)) Directory.Delete(newDir, recursive: true); } catch { }
             throw;
