@@ -3,7 +3,6 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using MmapCache.Config;
@@ -17,33 +16,27 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
     public static MmapCacheManager Initialize(string basePath)
     {
-        if (_instance is not null) throw new InvalidOperationException("Already initialized.");
+        if (_instance is not null)
+            throw new InvalidOperationException("Already initialized.");
+
         _instance = new MmapCacheManager(basePath);
         return _instance;
     }
 
-    public static MmapCacheManager Instance => _instance ?? throw new InvalidOperationException("Call Initialize() first.");
+    public static MmapCacheManager Instance =>
+        _instance ?? throw new InvalidOperationException("Call Initialize() first.");
 
     private readonly string _basePath;
+
     private readonly ConcurrentDictionary<string, ICacheDefinition> _defs = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, LsmEngine> _engines = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTime> _lastReloads = new(StringComparer.Ordinal);
-
-    /// <summary>
-    /// Tracks the current active version (N) for each cache.
-    /// Engine lives at {basePath}/{cacheName}_v{N}.
-    /// On each ReloadAsync the version increments: old engine stays alive for in-flight reads,
-    /// new engine is fully loaded, then the pointer is atomically swapped.
-    /// </summary>
     private readonly ConcurrentDictionary<string, int> _engineVersions = new(StringComparer.Ordinal);
-
-    /// <summary>
-    /// Per-cache reload guard: a cache name is present while its ReloadAsync is in flight.
-    /// A second concurrent ReloadAsync call for the same cache throws immediately.
-    /// <see cref="ConcurrentDictionary{TKey,TValue}.TryAdd"/> is atomic, so no further
-    /// synchronisation is needed.
-    /// </summary>
     private readonly ConcurrentDictionary<string, byte> _activeReloads = new(StringComparer.Ordinal);
+
+    private readonly CancellationTokenSource _shutdownCts = new();
+
+    public CancellationToken ShutdownToken => _shutdownCts.Token;
 
     private MmapCacheManager(string basePath)
     {
@@ -51,39 +44,33 @@ public sealed class MmapCacheManager : IAsyncDisposable
         Directory.CreateDirectory(basePath);
     }
 
-    // ── Directory helpers ─────────────────────────────────────────────────────
-
-    /// <summary>Physical directory for a specific cache version.</summary>
     private string GetEngineDir(string cacheName, int version) =>
         Path.Combine(_basePath, $"{cacheName}_v{version}");
 
-    /// <summary>
-    /// Scans for the highest existing versioned directory so that a warm restart
-    /// automatically resumes from the latest persisted data without calling the supplier.
-    /// </summary>
     private int FindLatestVersion(string cacheName)
     {
         int version = 0;
-        // Walk forward until there is no next version on disk.
         while (Directory.Exists(GetEngineDir(cacheName, version + 1)))
             version++;
+
         return version;
     }
 
-    // ── Registration ──────────────────────────────────────────────────────────
-
-    public void Register<TValue>(MmapCacheDefinition<TValue> def, CancellationToken ct = default!)
+    public void Register<TValue>(MmapCacheDefinition<TValue> def, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
+
         _defs[def.Name] = def;
 
-        // Pick up the highest existing version so warm restarts skip the supplier.
         int version = FindLatestVersion(def.Name);
         _engineVersions[def.Name] = version;
 
         string engineDir = GetEngineDir(def.Name, version);
+
         var engine = new LsmEngine(engineDir,
             flushThresholdBytes: def.MemTableFlushThresholdBytes,
             radixTreeCapacity: def.RadixTreeCapacity);
+
         _engines[def.Name] = engine;
 
         bool recovered = engine.Count > 0;
@@ -91,8 +78,11 @@ public sealed class MmapCacheManager : IAsyncDisposable
         if (!recovered)
         {
             var data = def.Supplier(ct);
+
             foreach (var kvp in data)
             {
+                ct.ThrowIfCancellationRequested();
+
                 byte[] valBytes = def.Serializer(kvp.Value);
 
                 long expireTicks = def.Ttl > TimeSpan.Zero
@@ -110,30 +100,26 @@ public sealed class MmapCacheManager : IAsyncDisposable
         _lastReloads[def.Name] = DateTime.UtcNow;
     }
 
-    // ── Read operations ───────────────────────────────────────────────────────
-
     public long Size(string cache)
-    {
-        var result = _engines.TryGetValue(cache, out var engine);
-        if (result == false) return 0L;
-        return engine?.Count ?? 0L;
-    }
+        => _engines.TryGetValue(cache, out var engine) ? engine.Count : 0;
 
     public bool Exists(string cache, string key)
     {
-        if (!_engines.TryGetValue(cache, out var engine)) return false;
+        if (!_engines.TryGetValue(cache, out var engine))
+            return false;
 
-        bool isExpired = false;
+        bool expired = false;
 
         bool found = engine.TryGet(key, bytes =>
         {
             if (bytes.Length < 8) return;
+
             long expireTicks = BinaryPrimitives.ReadInt64LittleEndian(bytes.Slice(0, 8));
             if (expireTicks > 0 && DateTime.UtcNow.Ticks > expireTicks)
-                isExpired = true;
+                expired = true;
         });
 
-        if (isExpired)
+        if (expired)
         {
             engine.Delete(key);
             return false;
@@ -144,11 +130,13 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
     public TValue? Get<TValue>(string cache, string key)
     {
-        if (!_engines.TryGetValue(cache, out var engine)) return default;
+        if (!_engines.TryGetValue(cache, out var engine))
+            return default;
 
         var def = GetDef<TValue>(cache);
+
         TValue? result = default;
-        bool isExpired = false;
+        bool expired = false;
 
         bool found = engine.TryGet(key, bytes =>
         {
@@ -157,36 +145,27 @@ public sealed class MmapCacheManager : IAsyncDisposable
             long expireTicks = BinaryPrimitives.ReadInt64LittleEndian(bytes.Slice(0, 8));
             if (expireTicks > 0 && DateTime.UtcNow.Ticks > expireTicks)
             {
-                isExpired = true;
+                expired = true;
                 return;
             }
 
-            var valueBytes = bytes.Slice(8);
-            result = def.Deserializer(valueBytes);
+            result = def.Deserializer(bytes.Slice(8));
         });
 
-        if (isExpired)
+        if (expired)
         {
             engine.Delete(key);
             return default;
         }
 
-        return result;
+        return found ? result : default;
     }
 
     public bool TryGet<TValue>(string cache, string key, out TValue? value)
     {
-        var result = Get<TValue>(cache, key);
-        if (result == null)
-        {
-            value = default;
-            return false;
-        }
-        value = result;
-        return true;
+        value = Get<TValue>(cache, key);
+        return value is not null;
     }
-
-    // ── Write operations ──────────────────────────────────────────────────────
 
     public void Put<TValue>(string cache, string key, TValue value, TimeSpan? customTtl = null)
     {
@@ -195,20 +174,14 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
         var def = GetDef<TValue>(cache);
 
-        byte[] valBytes = def.Serializer(value)
-            ?? throw new InvalidOperationException("Serializer returned null");
+        byte[] valBytes = def.Serializer(value);
 
         long expireTicks;
         var ttl = customTtl ?? def.Ttl;
 
-        if (ttl <= TimeSpan.Zero)
-        {
-            expireTicks = 0;
-        }
-        else
-        {
-            expireTicks = DateTime.UtcNow.Ticks + ttl.Ticks;
-        }
+        expireTicks = ttl <= TimeSpan.Zero
+            ? 0
+            : DateTime.UtcNow.Ticks + ttl.Ticks;
 
         byte[] payload = new byte[8 + valBytes.Length];
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(0, 8), expireTicks);
@@ -219,42 +192,33 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
     public void Delete(string cache, string key)
     {
-        if (!_engines.TryGetValue(cache, out var engine)) return;
-        engine.Delete(key);
+        if (_engines.TryGetValue(cache, out var engine))
+            engine.Delete(key);
     }
 
     public DateTime LastReload(string cache)
-    {
-        return _lastReloads.TryGetValue(cache, out var dt) ? dt : DateTime.MinValue;
-    }
+        => _lastReloads.TryGetValue(cache, out var dt) ? dt : DateTime.MinValue;
 
-    // ── Zero-downtime versioned reload ────────────────────────────────────────
-
-    /// <summary>
-    /// Reloads a cache with zero read downtime using versioned engine swap:
-    /// <list type="number">
-    ///   <item>Creates a new LsmEngine at <c>{cacheName}_v{N+1}</c>.</item>
-    ///   <item>Fully populates it from the supplier (reads still served by the current engine).</item>
-    ///   <item>Atomically swaps <c>_engines[cache]</c> to the new engine.</item>
-    ///   <item>Retires the old engine after a 250 ms grace period for in-flight reads.</item>
-    /// </list>
-    /// There is NO window where the cache returns empty data.
-    /// </summary>
     public async Task ReloadAsync<TValue>(string cache, CancellationToken ct = default)
     {
-        if (!_engines.TryGetValue(cache, out var oldEngine)) return;
+        if (!_engines.TryGetValue(cache, out var oldEngine))
+            return;
+
         var def = GetDef<TValue>(cache);
 
-        // Reject concurrent reloads for the same cache.  Two simultaneous reloads
-        // would write to the same versioned directory with separate LsmEngine
-        // instances, corrupt LSM files, and double-dispose the retiring engine.
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            ct,
+            _shutdownCts.Token);
+
+        var token = linkedCts.Token;
+
         if (!_activeReloads.TryAdd(cache, 0))
-            throw new InvalidOperationException(
-                $"Cache '{cache}' is already being reloaded. Wait for the current reload to finish or cancel other reload request before starting another.");
+            throw new CacheAlreadyReloadingException(
+                $"Cache '{cache}' is already being reloaded.");
 
         try
         {
-            await ReloadCoreAsync(def, cache, oldEngine, ct);
+            await ReloadCoreAsync(def, cache, oldEngine, token);
         }
         finally
         {
@@ -262,62 +226,63 @@ public sealed class MmapCacheManager : IAsyncDisposable
         }
     }
 
-    private async Task ReloadCoreAsync<TValue>(MmapCacheDefinition<TValue> def, string cache, LsmEngine oldEngine, CancellationToken ct)
+    private async Task ReloadCoreAsync<TValue>(
+        MmapCacheDefinition<TValue> def,
+        string cache,
+        LsmEngine oldEngine,
+        CancellationToken ct)
     {
         int oldVersion = _engineVersions.GetOrAdd(cache, 0);
         int newVersion = oldVersion + 1;
+
         string newDir = GetEngineDir(cache, newVersion);
 
-        // ── Phase 1: build shadow engine while old engine keeps serving reads ──
         var newEngine = new LsmEngine(newDir,
-            flushThresholdBytes: def.MemTableFlushThresholdBytes,
-            radixTreeCapacity: def.RadixTreeCapacity);
+            def.MemTableFlushThresholdBytes,
+            def.RadixTreeCapacity);
 
         try
         {
             await Task.Run(() => LoadFromSupplier(def, newEngine, ct), ct);
-
-            // Guard against cancellations that arrive after the supplier finishes
-            // but before the atomic swap — we must still roll back in that case.
             ct.ThrowIfCancellationRequested();
         }
         catch
         {
-            // Covers both supplier failures and cancellation at any point.
-            // Old engine is untouched; shadow engine and its directory are discarded.
             newEngine.Dispose();
-            try { if (Directory.Exists(newDir)) Directory.Delete(newDir, recursive: true); } catch { }
+
+            try { if (Directory.Exists(newDir)) Directory.Delete(newDir, true); } catch { }
+
             throw;
         }
 
-        // ── Phase 2: atomic pointer swap ─────────────────────────────────────
-        // From this point new readers go to newEngine.
-        // Threads that already captured oldEngine's reference continue safely.
         _engines[cache] = newEngine;
         _engineVersions[cache] = newVersion;
         _lastReloads[cache] = DateTime.UtcNow;
 
-        // ── Phase 3: retire old engine with a grace period ────────────────────
-        // 250 ms is enough for any in-flight TryGet/Get to finish under _engineLock.
         string oldDir = GetEngineDir(cache, oldVersion);
+
         _ = Task.Run(async () =>
         {
-            await Task.Delay(250, CancellationToken.None);
+            await Task.Delay(250);
             oldEngine.Dispose();
-            try { if (Directory.Exists(oldDir)) Directory.Delete(oldDir, recursive: true); } catch { }
+
+            try { if (Directory.Exists(oldDir)) Directory.Delete(oldDir, true); } catch { }
         });
     }
 
-    private void LoadFromSupplier<TValue>(MmapCacheDefinition<TValue> def, LsmEngine engine, CancellationToken ct = default)
+    private void LoadFromSupplier<TValue>(
+        MmapCacheDefinition<TValue> def,
+        LsmEngine engine,
+        CancellationToken ct)
     {
         var data = def.Supplier(ct);
-        if (data == null) return;
 
         foreach (var kvp in data)
         {
             ct.ThrowIfCancellationRequested();
 
             byte[] valBytes = def.Serializer(kvp.Value);
+
             long expireTicks = def.Ttl > TimeSpan.Zero
                 ? (DateTime.UtcNow + def.Ttl).Ticks
                 : 0;
@@ -330,41 +295,39 @@ public sealed class MmapCacheManager : IAsyncDisposable
         }
     }
 
-    // ── Key enumeration ───────────────────────────────────────────────────────
-
-    public IEnumerable<string> ScanKeys(string cacheName, string prefix = "")
+    public IEnumerable<string> ScanKeys(string cacheName, string prefix = "", CancellationToken ct = default)
     {
         if (!_engines.TryGetValue(cacheName, out var engine))
             return Array.Empty<string>();
 
-        return engine.EnumerateKeys(prefix);
+        return engine.EnumerateKeys(prefix, ct);
     }
 
-    public void ScanKeysZeroAlloc(string cacheName, RadixKeySpanConsumer consumer, string prefix = "")
+    public void ScanKeysZeroAlloc(string cacheName, RadixKeySpanConsumer consumer, string prefix = "", CancellationToken ct = default)
     {
         if (!_engines.TryGetValue(cacheName, out var engine))
             return;
 
-        engine.ScanKeysZeroAlloc(consumer, prefix);
+        engine.ScanKeysZeroAlloc(consumer, prefix, ct);
     }
 
-    // ── Disposal ──────────────────────────────────────────────────────────────
-
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        foreach (var engine in _engines.Values)
-        {
-            engine.Dispose();
-        }
-        return ValueTask.CompletedTask;
-    }
+        _shutdownCts.Cancel();
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+        foreach (var engine in _engines.Values)
+            engine.Dispose();
+
+        _shutdownCts.Dispose();
+
+        await ValueTask.CompletedTask;
+    }
 
     private MmapCacheDefinition<TValue> GetDef<TValue>(string cache)
     {
         if (!_defs.TryGetValue(cache, out var def))
             throw new KeyNotFoundException($"Cache definition '{cache}' not found.");
+
         return (MmapCacheDefinition<TValue>)def;
     }
 }

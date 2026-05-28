@@ -432,7 +432,7 @@ public unsafe class LsmEngine : IDisposable
     /// <summary>
     /// Enumerates all keys (with optional prefix filter) from the entire LSM tree.
     /// </summary>
-    public IEnumerable<string> EnumerateKeys(string prefix = "")
+    public IEnumerable<string> EnumerateKeys(string prefix = "", CancellationToken ct = default!)
     {
         _engineLock.EnterReadLock();
         try
@@ -440,7 +440,10 @@ public unsafe class LsmEngine : IDisposable
             if (Volatile.Read(ref _isDisposed) == 1)
                 yield break;
             foreach (var key in GetUnifiedKeys(prefix))
+            {
+                ct.ThrowIfCancellationRequested();
                 yield return key;
+            }
         }
         finally
         {
@@ -451,7 +454,7 @@ public unsafe class LsmEngine : IDisposable
     /// <summary>
     /// Zero‑allocation scan of keys (with optional prefix filter) from the entire LSM tree.
     /// </summary>
-    public void ScanKeysZeroAlloc(RadixKeySpanConsumer consumer, string prefix = "")
+    public void ScanKeysZeroAlloc(RadixKeySpanConsumer consumer, string prefix = "", CancellationToken ct = default!)
     {
         _engineLock.EnterReadLock();
         try
@@ -459,7 +462,10 @@ public unsafe class LsmEngine : IDisposable
             if (Volatile.Read(ref _isDisposed) == 1)
                 return;
             foreach (var key in GetUnifiedKeys(prefix))
+            {
+                ct.ThrowIfCancellationRequested();
                 consumer(key.AsSpan());
+            }
         }
         finally
         {

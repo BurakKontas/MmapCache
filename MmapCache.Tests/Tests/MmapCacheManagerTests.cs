@@ -372,7 +372,7 @@ public sealed class MmapCacheManagerTests
         var first = mgr.ReloadAsync<Widget>("w");
         var second = mgr.ReloadAsync<Widget>("w"); // must throw without waiting
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second);
+        var ex = await Assert.ThrowsAsync<CacheAlreadyReloadingException>(() => second);
         Assert.Contains("already being reloaded", ex.Message);
 
         // First reload must still succeed.
