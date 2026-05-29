@@ -69,7 +69,8 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
         var engine = new LsmEngine(engineDir,
             flushThresholdBytes: def.MemTableFlushThresholdBytes,
-            radixTreeCapacity: def.RadixTreeCapacity);
+            radixTreeCapacity: def.RadixTreeCapacity,
+            bootstrap: def.ReloadOnInit);
 
         _engines[def.Name] = engine;
 
@@ -239,7 +240,8 @@ public sealed class MmapCacheManager : IAsyncDisposable
 
         var newEngine = new LsmEngine(newDir,
             def.MemTableFlushThresholdBytes,
-            def.RadixTreeCapacity);
+            def.RadixTreeCapacity,
+            def.ReloadOnInit);
 
         try
         {

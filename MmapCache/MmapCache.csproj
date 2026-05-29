@@ -13,7 +13,7 @@
 		<!-- dotnet pack MmapCache.csproj -c Release -o ./artifacts -->
 		<!-- Package -->
 		<PackageId>MmapCache</PackageId>
-		<Version>1.0.6</Version>
+		<Version>1.0.7</Version>
 		<Authors>BurakKontas</Authors>
 		<Company>kontas.tr</Company>
 

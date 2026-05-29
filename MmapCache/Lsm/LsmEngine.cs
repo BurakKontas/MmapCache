@@ -66,7 +66,7 @@ public unsafe class LsmEngine : IDisposable
 
     public long Count => Interlocked.Read(ref _totalLiveCount);
 
-    public LsmEngine(string directory, long flushThresholdBytes = 64 * 1024 * 1024, int radixTreeCapacity = 1_000_000)
+    public LsmEngine(string directory, long flushThresholdBytes = 64 * 1024 * 1024, int radixTreeCapacity = 1_000_000, bool bootstrap = true)
     {
         _dir = directory;
         _flushThresholdBytes = flushThresholdBytes;
@@ -78,7 +78,8 @@ public unsafe class LsmEngine : IDisposable
         _bloomFilter = new BloomFilter(capacity: Math.Max(radixTreeCapacity, 1_000_000), errorRate: 0.01);
         _activeMemTable = new MemTable(_flushThresholdBytes, _radixTreeCapacity);
 
-        Bootstrap();
+        if (bootstrap)
+            Bootstrap();
 
         _activeWal = new WalWriter(Path.Combine(_dir, $"wal_{_nextSegmentId}.log"));
     }

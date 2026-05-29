@@ -44,4 +44,5 @@ public sealed class MmapCacheDefinition<TValue> : ICacheDefinition
     /// <summary>Max entries in the MemTable's off-heap radix tree index. This should be sized to hold the expected number of keys in the MemTable before flushing to disk, to avoid costly resizing operations during heavy write phases.</summary>
     public int RadixTreeCapacity { get; init; } = 1_000_000;
     public int MemTableFlushThresholdBytes { get; init; } = 64 * 1024 * 1024;
+    public bool ReloadOnInit { get; init; } = true;
 }
